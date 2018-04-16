@@ -632,18 +632,18 @@ class StreamingSGD(object):
 
             full_output_arr = self._full_output_lost[0][:self._stop_index]
             patch_output_arr = new_output_lost[0]
-            diff_c = torch.nonzero(full_output_arr != patch_output_arr)
+            diff_c = torch.nonzero(torch.stack(full_output_arr) != torch.stack(patch_output_arr))[0]
             max_diff = 0
             for c in diff_c:
                 diff = torch.max(patch_output_arr[c] - full_output_arr[c])
-                diff *= torch.max(self._full_output_lost[1][c[0]])
+                diff *= torch.max(torch.stack(self._full_output_lost[1])[c])
                 if diff > max_diff:
                     max_diff = diff
 
             print("!!!! We are losing", max_diff, "px information of the input image because of different loss profile")
 
             for li, l in enumerate(new_output_lost[0]):
-                print("new:", l, "old:",  self._full_output_lost[0][li])
+                print("tile:", l.tolist(), "img:",  self._full_output_lost[0][li].tolist())
 
             # TODO: Test this better
             # We need to add a certain margin because output lost can differ and
@@ -921,6 +921,9 @@ class StreamingSGD(object):
                 else:
                     output_channels = l.out_channels
 
+                if isinstance(l.padding, int):
+                    l.padding = [l.padding, l.padding]
+
                 # Equations of the paper
                 #
                 lost_due_kernel_row = (kernel_size[0] - cur_stride[0]) / 2
@@ -929,11 +932,11 @@ class StreamingSGD(object):
                 lost_due_kernel_column = (kernel_size[1] - cur_stride[1]) / 2
                 lost_due_stride_column = (last_shape[3] - kernel_size[1]) % cur_stride[1]
 
-                p_left = math.floor(lost_due_kernel_row)
-                p_right = math.ceil(lost_due_kernel_row) + lost_due_stride_row
+                p_left = math.floor(lost_due_kernel_row) + l.padding[1]
+                p_right = math.ceil(lost_due_kernel_row) + lost_due_stride_row + l.padding[1]
 
-                p_top = math.floor(lost_due_kernel_column)
-                p_bottom = math.ceil(lost_due_kernel_column) + lost_due_stride_column
+                p_top = math.floor(lost_due_kernel_column) + l.padding[0]
+                p_bottom = math.ceil(lost_due_kernel_column) + lost_due_stride_column + l.padding[0]
 
                 lost_this_layer = torch.FloatTensor([p_left, p_right, p_top, p_bottom])
                 downsamples.append(cur_stride)
@@ -945,9 +948,10 @@ class StreamingSGD(object):
 
                 # Check if reconstructions would be correct:
                 #
-                if total_lost_row != p_left + p_right or total_lost_column != p_bottom + p_top:
+                if total_lost_row != p_left + p_right - l.padding[0] * 2 or \
+                   total_lost_column != p_bottom + p_top - l.padding[1] * 2:
                     print("Invalid reconstruction, total lost row:", total_lost_row, "total lost column:",
-                          total_lost_column, "lost_this_layer", lost_this_layer)
+                          total_lost_column, "lost_this_layer", lost_this_layer.tolist)
                     print("Layer info", l, "kernel size:", kernel_size, "stride", cur_stride, "last_shape", last_shape)
 
                 next_shape = [1, output_channels, last_shape[2] - p_top - p_bottom, last_shape[2] - p_left - p_right]
