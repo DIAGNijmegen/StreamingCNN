@@ -22,8 +22,10 @@ giving equivalent results.
     - (all layer types are supported in the non-streaming part of the model)
   - Should work with all:
     - Operations performed on tensors before / after convolutional operations, e.g. non-linear activation functions
-    - Loss functions
+    - Loss functions (when using mini-batches: if they are averaged over the instances in the batch)
     - Optimizers
+  - Currently under development:
+    - Conv2d with padding
     
 # Model requirements
   - `model.layers`: list of layers in order of execution
