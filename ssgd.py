@@ -2,8 +2,8 @@
 Author: Hans Pinckaers
 April 11, 2018
 """
+import math
 import torch
-import numpy as np
 from tqdm import tqdm
 
 class StreamingSGD(object):
@@ -211,11 +211,11 @@ class StreamingSGD(object):
 
         # Sum the padding / output lost over the whole streaming part of the network
         #
-        lost = np.array(self._full_output_lost[0][0:self._stop_index]).sum(axis=0).astype(int)
+        lost = torch.stack(self._full_output_lost[0])[0:self._stop_index].sum(dim=0).int()
 
         # Fetch the last downsampling
         #
-        down = self._full_output_lost[1][self._stop_index - 1].astype(int)
+        down = self._full_output_lost[1][self._stop_index - 1].int()
 
         # With the lost + down it is possible to calculate the output_size
         # (= size of feature map to be reconstructed)
@@ -257,9 +257,8 @@ class StreamingSGD(object):
         """
         This function calculates the coordinates of the feature map for a given input box
         """
-        lost = np.array(output_lost[0][0:stop_index]).sum(axis=0).astype(int)
-        down = output_lost[1][stop_index - 1].astype(int)
-        lost = lost.astype(int)
+        lost = torch.stack(output_lost[0])[0:stop_index].sum(dim=0).int()
+        down = output_lost[1][stop_index - 1].int()
 
         # We always need a multiple of downsampling, otherwise downsampling layers
         # will not begin in the correct corner for example with down = 2,
@@ -277,9 +276,8 @@ class StreamingSGD(object):
         """
         This function calculates the coordinates of the input for a given feature map box
         """
-        lost = np.array(output_lost[0][0:stop_index]).sum(axis=0).astype(int)
-        down = output_lost[1][stop_index - 1].astype(int)
-        lost = lost.astype(int)
+        lost = torch.stack(output_lost[0])[0:stop_index].sum(dim=0).int()
+        down = output_lost[1][stop_index - 1].int()
 
         p_x = output_coords[0] * down[0]
         p_y = output_coords[1] * down[1]
@@ -352,10 +350,10 @@ class StreamingSGD(object):
         """
         sizes = []
         size = input_size
-        prev_down = (1., 1.)
+        prev_down = torch.FloatTensor([1., 1.])
         for i in range(stop_index):
             down = output_lost[1][i] / prev_down
-            lost = np.copy(output_lost[0][i])
+            lost = (output_lost[0][i]).clone()
             lost[0:2] /= output_lost[1][i]
             lost[2:] /= output_lost[1][i]
             size = ((size[0] - lost[0] - lost[1]) // down[0],
@@ -379,7 +377,7 @@ class StreamingSGD(object):
         # filled_grad_coords is the array that keeps track of which gradients are filled
         #
         if filled_grad_coords is None:
-            filled_grad_coords = np.zeros((len(gradients), 3))  # y, x, height
+            filled_grad_coords = torch.FloatTensor(len(gradients), 3).fill_(0)  # y, x, height
 
         # If we want to remember the reconstructed input gradient create the placeholder list
         #
@@ -397,7 +395,7 @@ class StreamingSGD(object):
 
         # Current coordinate of the input gradient of the reconstructed feature map
         #
-        c_coord = targed_map_coords[0:2]
+        c_coord = torch.FloatTensor(targed_map_coords[0:2])
 
         new_row = False
         for i, gradient in enumerate(gradients):
@@ -408,7 +406,7 @@ class StreamingSGD(object):
 
             if i == 0:
                 # We do not lose gradients in the first layer, since they come from the reconstructed feature map.
-                c_gradient_lost = [0, 0, 0, 0]
+                c_gradient_lost = torch.FloatTensor([0, 0, 0, 0])
             else:
                 # left right top bottom
                 c_gradient_lost = self._patch_output_lost[0][-(i)] * 2
@@ -579,8 +577,8 @@ class StreamingSGD(object):
         # This propably results in bigger input patches than needed.
         # Due to deadlines we leave it like this for now.
         #
-        box_size = [int(np.ceil(self._output_size[0] / self._divide_in)),
-                    int(np.ceil(self._output_size[1] / self._divide_in))]
+        box_size = [int(math.ceil(self._output_size[0] / self._divide_in)),
+                    int(math.ceil(self._output_size[1] / self._divide_in))]
 
         # The first layer overlap
         #
@@ -589,7 +587,7 @@ class StreamingSGD(object):
         # This loop does the actual calculation,
         # there is probably an easier approach than looping here.
         #
-        size = [box_size[0], box_size[1]]
+        size = torch.FloatTensor([box_size[0], box_size[1]])
         prev_down = self._full_output_lost[1][-1]
         for i in range(len(self._full_output_lost[0]) - 1):
             grad_lost = self._full_output_lost[0][-(i + 1)]
@@ -628,17 +626,17 @@ class StreamingSGD(object):
                                                              stop_index=self._stop_index)
 
         adjust_step = 0
-        if not np.all(np.array(self._full_output_lost[0])[:self._stop_index] == np.array(new_output_lost[0])):
+        if not (torch.stack(self._full_output_lost[0])[:self._stop_index] == torch.stack(new_output_lost[0])).all():
             print("!!!! New patch size has different output loss profile !!!! This could cause problems \
                   with required patch sizes. Further testing needed.")
 
-            full_output_arr = np.array(self._full_output_lost[0])[:self._stop_index]
-            patch_output_arr = np.array(new_output_lost[0])
-            diff_c = np.where(full_output_arr != patch_output_arr)
+            full_output_arr = self._full_output_lost[0][:self._stop_index]
+            patch_output_arr = new_output_lost[0]
+            diff_c = torch.nonzero(full_output_arr != patch_output_arr)
             max_diff = 0
             for c in diff_c:
-                diff = np.max(patch_output_arr[c] - full_output_arr[c])
-                diff *= np.max(self._full_output_lost[1][c[0]])
+                diff = torch.max(patch_output_arr[c] - full_output_arr[c])
+                diff *= torch.max(self._full_output_lost[1][c[0]])
                 if diff > max_diff:
                     max_diff = diff
 
@@ -654,14 +652,13 @@ class StreamingSGD(object):
             adjust_step = 1  # we should be able to calculate this, but for now assume 1 extra pixel for embedding
 
         size = [int(s) for s in size]
-        lost = np.array(new_output_lost[0][1:self._stop_index]).sum(axis=0).astype(int)
-        lost = (lost).astype(int)
+        lost = torch.stack(new_output_lost[0])[1:self._stop_index].sum(dim=0).int()
 
         first_lost = new_output_lost[0][0]
 
         patches = []
         grad_embedding_coords = []
-        down = new_output_lost[1][self._stop_index - 1].astype(int)
+        down = new_output_lost[1][self._stop_index - 1].int()
         for y in range(0, self._output_size[1], box_size[1] - adjust_step):
             for x in range(0, self._output_size[0], box_size[0] - adjust_step):
                 # Adjust the x and y with the total amount lost at the x and y
@@ -894,7 +891,7 @@ class StreamingSGD(object):
             if i == stop_index:
                 break
 
-            lost_this_layer = np.array([0, 0, 0, 0])
+            lost_this_layer = torch.FloatTensor([0, 0, 0, 0])
 
             # For the transposed convolutions the output size increases
             #
@@ -911,15 +908,15 @@ class StreamingSGD(object):
                 # A valid padding with filter size of 2 and stride of 2 results in a output size
                 # that is double the size of the input image. No pixels are lost.
                 #
-                downsamples.append(np.array([0.5, 0.5]))
+                downsamples.append(torch.FloatTensor([0.5, 0.5]))
             elif isinstance(l, torch.nn.UpsamplingBilinear2d):
-                downsamples.append(np.array([0.5, 0.5]))
+                downsamples.append(torch.FloatTensor([0.5, 0.5]))
             else:
-                cur_stride = np.array(l.stride)
+                cur_stride = torch.FloatTensor(l.stride)
                 kernel_size = l.kernel_size
 
                 if isinstance(l, torch.nn.MaxPool2d):
-                    cur_stride = np.array([l.stride, l.stride])
+                    cur_stride = torch.FloatTensor([l.stride, l.stride])
                     kernel_size = (kernel_size, kernel_size)
                 else:
                     output_channels = l.out_channels
@@ -932,19 +929,19 @@ class StreamingSGD(object):
                 lost_due_kernel_column = (kernel_size[1] - cur_stride[1]) / 2
                 lost_due_stride_column = (last_shape[3] - kernel_size[1]) % cur_stride[1]
 
-                p_left = np.floor(lost_due_kernel_row)
-                p_right = np.ceil(lost_due_kernel_row) + lost_due_stride_row
+                p_left = math.floor(lost_due_kernel_row)
+                p_right = math.ceil(lost_due_kernel_row) + lost_due_stride_row
 
-                p_top = np.floor(lost_due_kernel_column)
-                p_bottom = np.ceil(lost_due_kernel_column) + lost_due_stride_column
+                p_top = math.floor(lost_due_kernel_column)
+                p_bottom = math.ceil(lost_due_kernel_column) + lost_due_stride_column
 
-                lost_this_layer = np.array([p_left, p_right, p_top, p_bottom])
+                lost_this_layer = torch.FloatTensor([p_left, p_right, p_top, p_bottom])
                 downsamples.append(cur_stride)
 
                 # Different way of calculating total pixels lost
                 #
-                total_lost_row = last_shape[2] - (np.floor((last_shape[2] - kernel_size[0]) / cur_stride[0]) + 1) * cur_stride[0]
-                total_lost_column = last_shape[3] - (np.floor((last_shape[3] - kernel_size[1]) / cur_stride[1]) + 1) * cur_stride[1]
+                total_lost_row = last_shape[2] - (math.floor((last_shape[2] - kernel_size[0]) / cur_stride[0]) + 1) * cur_stride[0]
+                total_lost_column = last_shape[3] - (math.floor((last_shape[3] - kernel_size[1]) / cur_stride[1]) + 1) * cur_stride[1]
 
                 # Check if reconstructions would be correct:
                 #
@@ -958,20 +955,19 @@ class StreamingSGD(object):
                 next_shape[3] //= cur_stride[1]
 
                 if self._verbose:
-                    print(next_shape, cur_stride, lost_this_layer, l.__class__.__name__)
+                    print(next_shape, cur_stride.tolist(), lost_this_layer.tolist(), l.__class__.__name__)
 
             last_shape = next_shape
             lost.append(lost_this_layer)
 
         # Convert to float for potential upsampling
         #
-        downsamples = [np.array([float(x), float(y)]) for x, y in downsamples]
-        lost = [x.astype(float) for x in lost]
+        downsamples = [torch.FloatTensor([float(x), float(y)]) for x, y in downsamples]
 
         for i in range(1, len(downsamples)):
             downsamples[i] *= downsamples[i - 1]
             lost[i][0:2] *= downsamples[i - 1][0]
             lost[i][2:] *= downsamples[i - 1][1]
 
-        return lost, downsamples, np.array(lost).sum(axis=0).astype(int).tolist(), \
-            downsamples[-1].astype(int).tolist()
+        return lost, downsamples, torch.stack(lost).sum(dim=0).int().tolist(), \
+            downsamples[-1].int().tolist()
