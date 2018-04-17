@@ -564,11 +564,6 @@ class StreamingSGD(object):
         This function calculates the coordinates of the patches / tiles needed
         for the backward pass to reconstruct the relevant activations
         """
-        # Check if we can divide the feature map in the configured amount
-        #
-        if self._output_size[0] % self._divide_in > 0 or self._output_size[1] % self._divide_in > 0:
-            print("!!!! Check unequal size embedding!", self._output_size[0], "division asked:", self._divide_in)
-
         # Calculate forward patch sizes for gradient checkpointing
         #
         # NOTE: output lost * 2 is not always correct,
