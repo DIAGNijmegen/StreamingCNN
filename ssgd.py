@@ -220,6 +220,7 @@ class StreamingSGD(object):
 
         # With the lost + down it is possible to calculate the output_size
         # (= size of feature map to be reconstructed)
+        # TODO: _getreconstructioninformation knows this info, no need to recalculate
         #
         output_size = ((self._input_size[0] - lost[0] - lost[1] + padding[0] * 2) // down[0],
                        (self._input_size[1] - lost[2] - lost[3] + padding[1] * 2) // down[1])
@@ -238,12 +239,15 @@ class StreamingSGD(object):
         for y in range(0, output_size[1], patch_size[1]):
             for x in range(0, output_size[0], patch_size[0]):
                 # Calculate which part of the full image we need for this part of the feature map
+                # and take padding into account
                 #
                 padding = self._full_output_lost[3][self._stop_index - 1].int()
-                p_x = max(x - padding[0] - padding[2], 0)
-                p_y = max(y - padding[1] - padding[3], 0)
+                p_x = max(x - padding[0], 0)
+                p_y = max(y - padding[1], 0)
+                p_w = patch_size[0] + padding[2] + padding[0]
+                p_h = patch_size[1] + padding[3] + padding[1]
 
-                box = self._input_box_for_output((p_x, p_y, patch_size[0], patch_size[1]), self._full_output_lost, self._stop_index)
+                box = self._input_box_for_output((p_x, p_y, p_w, p_h), self._full_output_lost, self._stop_index)
 
                 # Keep track if we are at the sides (because we shouldn't crop the output here)
                 #
@@ -282,16 +286,15 @@ class StreamingSGD(object):
         This function calculates the coordinates of the input for a given feature map box
         """
         lost = torch.stack(output_lost[0])[0:stop_index].sum(dim=0).int()
-        # padding = torch.stack(output_lost[2])[0:stop_index].sum(dim=0).int()
-        # padding = torch.stack(output_lost[2])[0:stop_index].sum(dim=0).int()
         down = output_lost[1][stop_index - 1].int()
+        padding = self._full_output_lost[3][self._stop_index - 1].int()
 
         # print(lost, padding, down)
 
         p_x = output_coords[0] * down[0]
         p_y = output_coords[1] * down[1]
-        p_w = output_coords[2] * down[0] + lost[0] + lost[1]
-        p_h = output_coords[3] * down[1] + lost[2] + lost[3]
+        p_w = (output_coords[2] - padding[0] - padding[2]) * down[0] + lost[0] + lost[1]
+        p_h = (output_coords[3] - padding[1] - padding[3]) * down[1] + lost[2] + lost[3]
 
         return (p_y, p_y + p_h, p_x, p_x + p_w)  # top bottom left right
 
@@ -323,11 +326,15 @@ class StreamingSGD(object):
             # Do the actual forward pass
             #
             patch_output = self.model.forward(data, self._stop_index, detach=False)
-            print(patch_output.shape)
 
             # Deal with padding
             #
             padding = self._patch_output_lost[3][self._stop_index - 1].int()
+            p_x = padding[0]
+            p_w = padding[2]
+            p_y = padding[1]
+            p_h = padding[3]
+
             if sides[0]:  # left
                 p_x = 0
                 p_w = padding[0] + padding[2]
@@ -335,18 +342,15 @@ class StreamingSGD(object):
                 p_y = 0
                 p_h = padding[1] + padding[3]
             if sides[2]:  # right
-                p_x = padding[0] + padding[2]
+                p_x = padding[0]
                 p_w = 0
             if sides[3]:  # bottom
-                p_y = padding[1] + padding[3]
+                p_y = padding[1]
                 p_h = 0
-
-            print(sides, p_y, p_h, p_x, p_w)
 
             patch_output = patch_output[:, :,
                                         p_y:patch_output.shape[2] - p_h,
                                         p_x:patch_output.shape[3] - p_w]
-
             c = patch_output.shape[1]
 
             # Create (to be reconstructed) feature_map placeholder variable if it doesn't exists yet
@@ -363,7 +367,7 @@ class StreamingSGD(object):
 
             # Save the output of the network in the relevant part of the feature_map
             #
-            feature_map[:, :, map_c[0]:map_c[1], map_c[2]:map_c[3]] = patch_output.clone()
+            feature_map[:, :, map_c[0]:map_c[1], map_c[2]:map_c[3]] = patch_output
             patch_output = None  # trying memory management
 
         # From the feature map on we have to be able to generate gradients again
@@ -1021,10 +1025,10 @@ class StreamingSGD(object):
             c_padding[2] += padding[i][0]
             c_padding[3] += padding[i][1]
 
-            c_padding[0] = math.floor(c_padding[0] / downsamples[i][0])
-            c_padding[1] = math.floor(c_padding[1] / downsamples[i][1])
-            c_padding[2] = math.ceil(c_padding[2] / downsamples[i][0])
-            c_padding[3] = math.ceil(c_padding[3] / downsamples[i][1])
+            c_padding[0] = math.ceil(c_padding[0] / downsamples[i][0])
+            c_padding[1] = math.ceil(c_padding[1] / downsamples[i][1])
+            c_padding[2] = math.floor(c_padding[2] / downsamples[i][0])
+            c_padding[3] = math.floor(c_padding[3] / downsamples[i][1])
 
             downsamples[i] *= downsamples[i - 1]
             lost[i][0:2] *= downsamples[i - 1][0]
