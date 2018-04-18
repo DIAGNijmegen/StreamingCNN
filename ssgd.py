@@ -121,6 +121,7 @@ class StreamingSGD(object):
 
         prev_down = output_lost[1][-1]
         for i in range(len(output_lost[0]) - 1):
+            grad_padding = output_lost[3][-(i + 1)]
             grad_lost = output_lost[0][-(i + 1)]
             grad_lost = (grad_lost * 2)
             grad_down = output_lost[1][-(i + 2)]
@@ -139,17 +140,30 @@ class StreamingSGD(object):
             v_y += grad_lost[2]
             v_h += grad_lost[3]
 
+            p_x = grad_padding[0]
+            p_w = grad_padding[2]
+            p_y = grad_padding[1]
+            p_h = grad_padding[3]
+
             if sides[0] == 1:
                 v_x = 0
+                p_x = 0
+                p_w = grad_padding[2]
             if sides[1] == 1:
                 v_y = 0
+                p_y = 0
+                p_h = grad_padding[3]
             if sides[2] == 1:
                 v_w = 0
+                p_x = grad_padding[0]
+                p_w = 0
             if sides[3] == 1:
                 v_h = 0
+                p_y = grad_padding[1]
+                p_h = 0
 
             prev_down = grad_down
-            valid_boxes.append((int(v_y), int(v_h), int(v_x), int(v_w)))
+            valid_boxes.append((int(v_y + p_y), int(v_h + p_h), int(v_x + p_x), int(v_w + p_w)))
 
         return valid_boxes
 
@@ -268,6 +282,7 @@ class StreamingSGD(object):
         """
         lost = torch.stack(output_lost[0])[0:stop_index].sum(dim=0).int()
         down = output_lost[1][stop_index - 1].int()
+        padding = self._full_output_lost[3][self._stop_index - 1].int()
 
         # We always need a multiple of downsampling, otherwise downsampling layers
         # will not begin in the correct corner for example with down = 2,
@@ -275,8 +290,8 @@ class StreamingSGD(object):
         #
         p_x = input_coords[0] / down[0]
         p_y = input_coords[1] / down[1]
-        p_w = (input_coords[2] - lost[0] - lost[1]) / down[0]
-        p_h = (input_coords[3] - lost[3] - lost[2]) / down[1]
+        p_w = math.ceil((input_coords[2] - lost[0] - lost[1]) / down[0]) + padding[0] + padding[2]
+        p_h = math.ceil((input_coords[3] - lost[3] - lost[2]) / down[1]) + padding[1] + padding[3]
 
         # top bottom left right
         return (int(p_y), int(p_y + p_h), int(p_x), int(p_x + p_w))
@@ -290,7 +305,7 @@ class StreamingSGD(object):
         padding = self._full_output_lost[3][self._stop_index - 1].int()
 
         # print(lost, padding, down)
-
+        # set_trace()
         p_x = output_coords[0] * down[0]
         p_y = output_coords[1] * down[1]
         p_w = (output_coords[2] - padding[0] - padding[2]) * down[0] + lost[0] + lost[1]
@@ -391,13 +406,14 @@ class StreamingSGD(object):
         prev_down = torch.FloatTensor([1., 1.])
         for i in range(stop_index):
             down = output_lost[1][i] / prev_down
+            padding = output_lost[2][i].clone()
             lost = (output_lost[0][i]).clone()
+            padding /= output_lost[1][i]
             lost[0:2] /= output_lost[1][i]
             lost[2:] /= output_lost[1][i]
-            size = ((size[0] - lost[0] - lost[1]) // down[0],
-                    (size[1] - lost[2] - lost[3]) // down[1])
+            size = ((size[0] - lost[0] - lost[1] + padding[0] * 2) // down[0],
+                    (size[1] - lost[2] - lost[3] + padding[1] * 2) // down[1])
             sizes.append(size)
-
             prev_down = output_lost[1][i]
 
         return sizes
@@ -445,15 +461,18 @@ class StreamingSGD(object):
             if i == 0:
                 # We do not lose gradients in the first layer, since they come from the reconstructed feature map.
                 c_gradient_lost = torch.FloatTensor([0, 0, 0, 0])
+                c_padding = torch.FloatTensor([0, 0, 0, 0])
             else:
                 # left right top bottom
                 c_gradient_lost = self._patch_output_lost[0][-(i)] * 2
+                c_padding = self._patch_output_lost[3][-(i + 1)]  # TODO: check i + 1 or i!
 
             # Calculate how much of the input is lost in the conv operation of this layer
             #
             c_gradient_down = prev_down / self._patch_output_lost[1][-(i + 1)]
             c_gradient_lost[0:2] /= self._patch_output_lost[1][-(i + 1)]
             c_gradient_lost[2:] /= self._patch_output_lost[1][-(i + 1)]
+
             prev_down = self._patch_output_lost[1][-(i + 1)]
 
             # Calculate current coords
@@ -467,13 +486,13 @@ class StreamingSGD(object):
             else:
                 # otherwise we need to offset for input lost
                 #
-                c_coord[0] += c_gradient_lost[2]
+                c_coord[0] += c_gradient_lost[2] + c_padding[1]
 
             # Same holds for x-axes
             if c_coord[1] <= 0:
                 c_coord[1] = 0
             else:
-                c_coord[1] += c_gradient_lost[0]
+                c_coord[1] += c_gradient_lost[0] + c_padding[0]
 
             # Calculate relevant gradient coords
             #
@@ -622,6 +641,10 @@ class StreamingSGD(object):
         #
         size = torch.FloatTensor([box_size[0], box_size[1]])
         prev_down = self._full_output_lost[1][-1]
+
+        padding = self._full_output_lost[3][self._stop_index - 1].int()
+        size[0] += padding[0] + padding[2]
+        size[1] += padding[1] + padding[3]
         for i in range(len(self._full_output_lost[0]) - 1):
             grad_lost = self._full_output_lost[0][-(i + 1)]
 
@@ -902,8 +925,8 @@ class StreamingSGD(object):
                 correct = False
                 break
         if not correct:
-            print("!!!! Some gradient are smaller than they should be, \
-                  this means we loose some information on the edges.",
+            print("!!!! Some gradient are smaller than they should be",
+                  "this means we loose some information on the edges.",
                   "See log of configure() for information.\n")
 
         return correct
@@ -913,6 +936,7 @@ class StreamingSGD(object):
         # could make some code in this class easier
 
         # NOTE: lost = left right top bottom
+        # padding = left top right bottom
         #
         lost = []
         padding = []
