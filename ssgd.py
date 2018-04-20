@@ -56,6 +56,7 @@ class StreamingSGD(object):
         # Precalculate the coordinates of the tiles in the backward pass
         #
         self._back_patches, self._grad_map_coords, self._patch_output_lost = self._backward_patches_coords()
+        # print(self._back_patches)
 
         if self._verbose:
             print("Patch size forward:", (self._forward_patches_c[0][1][1], self._forward_patches_c[0][1][3]), "\n")
@@ -119,16 +120,26 @@ class StreamingSGD(object):
         v_w = 0
         v_h = 0
 
+        p_x = 0
+        p_y = 0
+        p_w = 0
+        p_h = 0
+
         prev_down = output_lost[1][-1]
         for i in range(len(output_lost[0]) - 1):
-            grad_padding = output_lost[3][-(i + 1)]
-            grad_lost = output_lost[0][-(i + 1)]
+            grad_padding = output_lost[3][-(i + 1)].clone()
+            grad_lost = output_lost[0][-(i + 1)].clone()
+
             grad_lost = (grad_lost * 2)
             grad_down = output_lost[1][-(i + 2)]
+
             factor = prev_down / grad_down
 
             grad_lost[0:2] /= grad_down
             grad_lost[2:] /= grad_down
+
+            # grad_padding[0:2] /= factor
+            # grad_padding[2:] /= factor
 
             v_x *= factor[0]
             v_w *= factor[0]
@@ -164,6 +175,7 @@ class StreamingSGD(object):
 
             prev_down = grad_down
             valid_boxes.append((int(v_y + p_y), int(v_h + p_h), int(v_x + p_x), int(v_w + p_w)))
+        # print(valid_boxes)
 
         return valid_boxes
 
@@ -190,32 +202,57 @@ class StreamingSGD(object):
         # List with the cropped gradients
         #
         correct = []
-
+        # print(sides, valid_gradients_loss)
         for index in range(len(patch_gradients)):
             if index == 0:
-                p_grad = patch_gradients[0].data
-                correct.append(p_grad)
+                # grad_padding = output_lost[3][-1]
+
+                # p_x = grad_padding[0]
+                # p_w = grad_padding[2]
+                # p_y = grad_padding[1]
+                # p_h = grad_padding[3]
+
+                # if sides[0] == 1:
+                #     p_x = 0
+                #     p_w = grad_padding[2]
+                # if sides[1] == 1:
+                #     p_y = 0
+                #     p_h = grad_padding[3]
+                # if sides[2] == 1:
+                #     p_x = grad_padding[0]
+                #     p_w = 0
+                # if sides[3] == 1:
+                #     p_y = grad_padding[1]
+                #     p_h = 0
+
+                # g_lost = [int(p_y), int(p_h), int(p_x), int(p_w)]
+
+                g_lost = [0, 0, 0, 0]
+
             else:
                 # Fetch gradient 'lost' in this layer
                 #
                 g_lost = valid_gradients_loss[index - 1]
 
-                # Crop the gradient
-                #
-                p_grad = patch_gradients[index]
-                p_grad = p_grad[:, :,
-                                g_lost[0]:p_grad.shape[2] - g_lost[1],
-                                g_lost[2]:p_grad.shape[3] - g_lost[3]]
+            # Crop the gradient
+            #
+            p_grad = patch_gradients[index]
+            # print(index, p_grad.shape, g_lost)
+            p_grad = p_grad[:, :,
+                            g_lost[0]:p_grad.shape[2] - g_lost[1],
+                            g_lost[2]:p_grad.shape[3] - g_lost[3]]
 
-                # Crop the output
-                #
-                patch_output = patch_outputs[-(index + 1)]
-                patch_outputs[-(index + 1)] = patch_output[:, :,
-                                                           g_lost[0]:patch_output.shape[2] - g_lost[1],
-                                                           g_lost[2]:patch_output.shape[3] - g_lost[3]]
-                correct.append(p_grad)
+            # Crop the output
+            #
+            patch_output = patch_outputs[-(index + 1)]
+            patch_outputs[-(index + 1)] = patch_output[:, :,
+                                                       g_lost[0]:patch_output.shape[2] - g_lost[1],
+                                                       g_lost[2]:patch_output.shape[3] - g_lost[3]]
 
-        return correct, patch_outputs
+            # print("new shape:", p_grad.shape)
+            correct.append(p_grad)
+
+        return correct, patch_outputs, valid_gradients_loss
 
     def _forward_patches_coords(self):
         """
@@ -261,6 +298,8 @@ class StreamingSGD(object):
                 p_w = patch_size[0] + padding[2] + padding[0]
                 p_h = patch_size[1] + padding[3] + padding[1]
 
+                # print(p_x, p_y)
+
                 box = self._input_box_for_output((p_x, p_y, p_w, p_h), self._full_output_lost, self._stop_index)
 
                 # Keep track if we are at the sides (because we shouldn't crop the output here)
@@ -270,6 +309,8 @@ class StreamingSGD(object):
                 sides[2] = 1 if x + patch_size[0] + padding[0] + padding[2] >= output_size[0] else 0
                 sides[1] = 1 if y == 0 else 0
                 sides[3] = 1 if y + patch_size[1] + padding[1] + padding[3] >= output_size[1] else 0
+
+                # print(box)
 
                 embedding_coords.append((y, int(y + patch_size[1]), x, int(x + patch_size[0])))
                 boxes.append((sides, box))
@@ -418,7 +459,7 @@ class StreamingSGD(object):
 
         return sizes
 
-    def _relevant_gradients(self, gradients, targed_map_coords, outputs, filled_grad_coords, fill_gradients=False, full_gradients=None):
+    def _relevant_gradients(self, gradients, targed_map_coords, grad_crop_box, outputs, filled_grad_coords, fill_gradients=False, full_gradients=None):
         """
         Gradients should be in order of network layers
         We assume patches are backpropped from left to right, top to bottom
@@ -465,7 +506,7 @@ class StreamingSGD(object):
             else:
                 # left right top bottom
                 c_gradient_lost = self._patch_output_lost[0][-(i)] * 2
-                c_padding = self._patch_output_lost[3][-(i + 1)]  # TODO: check i + 1 or i!
+                c_padding = self._patch_output_lost[3][-(i)]
 
             # Calculate how much of the input is lost in the conv operation of this layer
             #
@@ -478,6 +519,8 @@ class StreamingSGD(object):
             # Calculate current coords
             #
             c_coord *= c_gradient_down
+            # if c_gradient_coords[1] > 0:
+            #     set_trace()
 
             # If we already were at the border, the new gradient location is also there
             #
@@ -493,6 +536,13 @@ class StreamingSGD(object):
                 c_coord[1] = 0
             else:
                 c_coord[1] += c_gradient_lost[0] + c_padding[0]
+
+            # if i == 0:
+            # set_trace()
+            # print(i, c_coord.tolist(), c_padding.tolist(), c_gradient_coords.tolist())
+
+            # if i == 1:
+            # print(c_padding.tolist(), c_coord.tolist(), c_gradient_size)
 
             # Calculate relevant gradient coords
             #
@@ -525,7 +575,9 @@ class StreamingSGD(object):
             #
             elif c_coord[1] + gradient.shape[3] > c_gradient_coords[1]:
                 if c_gradient_coords[1] - c_coord[1] < 0:
-                    print("We miss pieces of gradient in x-direction! Continuing...")
+                    print("gradient i:", i, "misses gradient in x-direction! Will probably crash...")
+                    print("We should be at:", c_gradient_coords[1], "but are at:", c_coord[1])
+                    print("Gradient size:", gradient.shape)
                     continue
                 rel_coords[2] = c_gradient_coords[1] - c_coord[1]
                 rel_coords[3] = gradient.shape[3]
@@ -544,7 +596,8 @@ class StreamingSGD(object):
             #
             elif c_coord[0] + gradient.shape[2]:
                 if c_gradient_coords[0] - c_coord[0] < 0:
-                    print("We miss pieces of gradient in x-direction! Continuing...")
+                    print("We miss pieces of gradient in y-direction! Continuing...")
+                    print("We should be at:", c_gradient_coords[0], "but are at:", c_coord[0])
                     continue
                 rel_coords[0] = c_gradient_coords[0] - c_coord[0]
                 rel_coords[1] = gradient.shape[2]
@@ -567,11 +620,6 @@ class StreamingSGD(object):
 
             rel_coords = [int(coord) for coord in rel_coords]
 
-            if rel_coords[3] - rel_coords[2] == 0:
-                continue
-            if rel_coords[1] - rel_coords[0] == 0:
-                continue
-
             if rel_coords[0] < 0:
                 print("We miss gradients in y-axis before:", c_coord)
             if rel_coords[2] < 0:
@@ -579,20 +627,31 @@ class StreamingSGD(object):
 
             # Clone the right gradients and save the corresponding output
             #
+            if rel_coords[1] - rel_coords[0] == 0:
+                continue
+
             rel_gradient = gradient[:, :, rel_coords[0]:rel_coords[1], rel_coords[2]:rel_coords[3]]
             rel_output = outputs[-(i + 1)][:, :, rel_coords[0]:rel_coords[1], rel_coords[2]:rel_coords[3]]
 
+            ###################
+            if c_coord[0] > 0:
+                c_coord[0] += c_padding[1]
+
+            # Same holds for x-axes
+            if c_coord[1] > 0:
+                c_coord[1] += c_padding[0]
+            ####################
             # If we want to return the reconstructed input gradients to each layer, save them here
             #
-            if fill_gradients and i > 0:
-                if i > len(full_gradients):
+            if fill_gradients:
+                if i == len(full_gradients):
                     full_gradients.append(
                         torch.autograd.Variable(
                             torch.FloatTensor(1, rel_gradient.shape[1],
                                               int(self._gradient_sizes[-(i + 1)][0]),
                                               int(self._gradient_sizes[-(i + 1)][1]))))
 
-                    full_gradients[i - 1].fill_(0)
+                    full_gradients[i].fill_(0)
 
                 # Check if in this part of the gradient we didn't already put values
                 #
@@ -603,11 +662,11 @@ class StreamingSGD(object):
                 #                                          int(c_gradient_coords[1])]) > 0:
                 #    print("Overwriting!")
 
-                full_gradients[i - 1][:, :,
-                                      int(c_gradient_coords[0]):
-                                      int(c_gradient_coords[2]),
-                                      int(c_gradient_coords[1] - rel_gradient.shape[3]):
-                                      int(c_gradient_coords[1])] = rel_gradient
+                full_gradients[i][:, :,
+                                  int(c_gradient_coords[0]):
+                                  int(c_gradient_coords[2]),
+                                  int(c_gradient_coords[1] - rel_gradient.shape[3]):
+                                  int(c_gradient_coords[1])] = rel_gradient.clone()
 
             rel_gradients.append((rel_gradient.clone(), rel_output))
 
@@ -635,44 +694,48 @@ class StreamingSGD(object):
         # The first layer overlap
         #
         first_lost = self._full_output_lost[0][0]
+        first_pad = self._full_output_lost[2][0]
 
         # This loop does the actual calculation,
         # there is probably an easier approach than looping here.
         #
         size = torch.FloatTensor([box_size[0], box_size[1]])
+        padding = self._full_output_lost[3][-1].clone()
         prev_down = self._full_output_lost[1][-1]
-
-        padding = self._full_output_lost[3][self._stop_index - 1].int()
         size[0] += padding[0] + padding[2]
         size[1] += padding[1] + padding[3]
         for i in range(len(self._full_output_lost[0]) - 1):
-            grad_lost = self._full_output_lost[0][-(i + 1)]
+            grad_lost = self._full_output_lost[0][-(i + 1)].clone()
+            padding = self._full_output_lost[2][-(i + 1)].clone()
 
             # We lose twice the amount of valid gradient (see paper)
             #
             grad_lost = (grad_lost * 2)
+            # padding = (padding * 2)
 
             # Keep track of downsampling factor
             #
             grad_down = self._full_output_lost[1][-(i + 1)]
+
             factor = prev_down / grad_down
             size *= factor
 
             grad_lost[0:2] /= grad_down
             grad_lost[2:] /= grad_down
+            padding = padding / grad_down
 
             # Sum the amount of gradient lost to the current size
             #
-            size[0] += grad_lost[0] + grad_lost[1]
-            size[1] += grad_lost[2] + grad_lost[3]
+            size[0] += grad_lost[0] + grad_lost[1] + padding[1] * 2
+            size[1] += grad_lost[2] + grad_lost[3] + padding[0] * 2
 
             prev_down = grad_down
 
         # Since we do not need to reconstruct the gradient of the first layer
         # we can use the normal overlap here
         #
-        size[0] += first_lost[0] + first_lost[1]
-        size[1] += first_lost[2] + first_lost[3]
+        size[0] += first_lost[0] + first_lost[1] + first_pad[1] * 2
+        size[1] += first_lost[2] + first_lost[3] + first_pad[0] * 2
 
         # Here we check if the convolutions fit the same between the tiles and
         # the full input image
@@ -709,6 +772,7 @@ class StreamingSGD(object):
 
         size = [int(s) for s in size]
         lost = torch.stack(new_output_lost[0])[1:self._stop_index].sum(dim=0).int()
+        # padding = torch.stack(new_output_lost[2])[1:self._stop_index].sum(dim=0).int()
 
         first_lost = new_output_lost[0][0]
 
@@ -720,11 +784,17 @@ class StreamingSGD(object):
                 # Adjust the x and y with the total amount lost at the x and y
                 # This would be the coordinates of the tile
                 #
-                p_x = x * down[0] - lost[0]
-                p_y = y * down[1] - lost[2]
+                padding = self._full_output_lost[3][self._stop_index - 1].int()
+
+                p_x = x * down[0] - lost[0] - padding[0] - padding[2]
+                p_y = y * down[1] - lost[2] - padding[1] - padding[3]
+
+                p_x = (x - math.ceil(lost[0] / down[0]) - padding[0] - padding[2]) * down[0]
+                p_y = (y - math.ceil(lost[2] / down[1]) - padding[1] - padding[3]) * down[1]
 
                 p_w = size[0]
                 p_h = size[1]
+                # set_trace()
 
                 # We need to keep track which tiles are on the edge,
                 # since we shouldn't crop gradients there.
@@ -747,6 +817,7 @@ class StreamingSGD(object):
                 #
                 grad_embed = self._output_box_for_input((p_x, p_y, p_w, p_h), new_output_lost, self._stop_index)
                 grad_embedding_coords.append((grad_embed, (grad_embed[0], grad_embed[2])))
+
                 patches.append((sides, (p_y, p_y + p_h, p_x, p_x + p_w)))
 
         return patches, grad_embedding_coords, new_output_lost
@@ -773,6 +844,7 @@ class StreamingSGD(object):
 
             # Extract the tile
             #
+            # print("coords", coords)
             patch = image[:, :, coords[0]:coords[1], coords[2]:coords[3]].clone()  # TODO: test if clone() here is needed
             if self._cuda:
                 patch = patch.cuda()
@@ -784,11 +856,11 @@ class StreamingSGD(object):
 
             # Do the actual partial forward pass and backward pass of the tile
             #
-            val_gradients, outputs = self._valid_gradients(patch,
-                                                           patch_map_grad,
-                                                           self._stop_index,
-                                                           self._patch_output_lost,
-                                                           sides)
+            val_gradients, outputs, grads_crop_boxes = self._valid_gradients(patch,
+                                                                             patch_map_grad,
+                                                                             self._stop_index,
+                                                                             self._patch_output_lost,
+                                                                             sides)
 
             # The coordinates of the reconstructed gradients w.r.t. the original input gradients
             #
@@ -798,6 +870,7 @@ class StreamingSGD(object):
             #
             rel_grads, filled_grad_coords, full_gradients = self._relevant_gradients(val_gradients,
                                                                                      current_grad_pos,
+                                                                                     grads_crop_boxes,
                                                                                      outputs,
                                                                                      filled_grad_coords,
                                                                                      fill_gradients=fill_gradients,
@@ -1065,5 +1138,7 @@ class StreamingSGD(object):
             layer_padding[i][1] = c_padding[1]
             layer_padding[i][2] = c_padding[2]
             layer_padding[i][3] = c_padding[3]
+
+        # print(layer_padding)
 
         return lost, downsamples, padding, layer_padding
