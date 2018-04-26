@@ -5,7 +5,190 @@ April 11, 2018
 import math
 import torch
 from tqdm import tqdm
-# from IPython.core.debugger import set_trace
+from IPython.core.debugger import set_trace
+from collections import namedtuple
+
+# Utility named tuples, makes code more readable
+#
+class Box(namedtuple('Box', 'y height x width sides')):
+    def __str__(self):
+        return '(Box x:%5.1f y:%5.1f width:%5.1f height:%5.1f)' % (self.x, self.y, self.width, self.height)
+
+class Sides(namedtuple('Sides', 'left top right bottom')):
+    def __str__(self):
+        return '(Sides left:%r top:%r right:%r bottom:%r' % (self.left, self.top, self.right, self.bottom)
+
+class IOShape(namedtuple('IOShape', 'batch channels height width')):
+    def __str__(self):
+        return '(IOShape batch:%2.1f channels:%2.1f height:%2.1f width:%2.1f)' % (self.batch, self.channels, self.height, self.width)
+
+class Lost(namedtuple('Lost', 'top left bottom right')):
+    def __str__(self):
+        return '(Lost top:%2.1f left:%2.1f bottom:%2.1f right:%2.1f)' % (self.top, self.left, self.bottom, self.right)
+
+class LayerStats(object):
+    """This class is responsible for calculating layer specific statistics,
+    such as padding, output lost, gradient invalidated by convolution / zero-padding
+    """
+    def __init__(self, layer, padding, output_lost, downsamples, gradient_lost, output_shape):
+        self.next = []
+        self.previous = []
+        self.padding = padding
+        self.output_lost = output_lost
+        self.gradient_lost = gradient_lost
+        self.output_shape = output_shape
+        self.downsamples = downsamples
+        self.layer = layer
+
+    @classmethod
+    def stats_with_layer(cls, layer, input_shape):
+        output_channels = input_shape[1]
+        cur_stride = torch.FloatTensor(layer.stride)
+        kernel_size = layer.kernel_size
+        c_padding = layer.padding
+
+        if isinstance(layer, torch.nn.MaxPool2d):
+            cur_stride = torch.FloatTensor([layer.stride, layer.stride])
+            kernel_size = (kernel_size, kernel_size)
+        else:
+            output_channels = layer.out_channels
+
+        if isinstance(layer.padding, int):
+            c_padding = [layer.padding, layer.padding]
+
+        downsamples = cur_stride
+
+        # Equations of the paper
+        #
+        lost_due_kernel_row = (kernel_size[0] - cur_stride[0]) / 2
+        lost_due_stride_row = (input_shape[2] + c_padding[0] * 2 - kernel_size[0]) % cur_stride[0]
+        lost_due_kernel_column = (kernel_size[1] - cur_stride[1]) / 2
+        lost_due_stride_column = (input_shape[3] + c_padding[1] * 2 - kernel_size[1]) % cur_stride[1]
+
+        p_left = math.floor(lost_due_kernel_row)
+        p_right = math.ceil(lost_due_kernel_row) + lost_due_stride_row
+        p_top = math.floor(lost_due_kernel_column)
+        p_bottom = math.ceil(lost_due_kernel_column) + lost_due_stride_column
+
+        lost_this_layer = Lost(top=p_top, left=p_left, bottom=p_bottom, right=p_right)
+        grad_lost_this_layer = Lost(top=p_top * 2, left=p_left * 2, bottom=p_bottom * 2, right=p_right * 2)
+        padding_this_layer = Lost(top=c_padding[1], left=c_padding[0], bottom=c_padding[1], right=c_padding[0])
+
+        next_shape = [1, output_channels,
+                      input_shape[2] - p_top - p_bottom + c_padding[0] * 2,
+                      input_shape[2] - p_left - p_right + c_padding[1] * 2]
+
+        next_shape[2] //= cur_stride[0]
+        next_shape[3] //= cur_stride[1]
+
+        next_shape = IOShape(1, next_shape[1], next_shape[2], next_shape[3])
+
+        return cls(
+            layer=layer,
+            output_shape=next_shape,
+            output_lost=lost_this_layer,
+            padding=padding_this_layer,
+            gradient_lost=grad_lost_this_layer,
+            downsamples=downsamples
+        )
+
+    def calculate_input_shape(self, output_shape, valid=False, recursive=True, gradient_lost=False):
+        if not gradient_lost:
+            input_height = output_shape.height * self.downsamples[0] + self.output_lost.top + self.output_lost.bottom
+            input_width = output_shape.width * self.downsamples[1] + self.output_lost.left + self.output_lost.right
+        else:
+            input_height = output_shape.height * self.downsamples[0] + self.gradient_lost.top + self.gradient_lost.bottom
+            input_width = output_shape.width * self.downsamples[1] + self.gradient_lost.left + self.gradient_lost.right
+
+        if not valid:
+            input_height -= self.padding.top + self.padding.bottom
+            input_width -= self.padding.left + self.padding.right
+
+        shape = IOShape(batch=output_shape.batch,
+                        channels=output_shape.channels,
+                        height=input_height,
+                        width=input_width)
+
+        if recursive and self.previous is not None:
+            return self.previous.calculate_input_shape(shape, valid)
+        else:
+            return shape
+
+    @property
+    def total_downsampling(self):
+        # should probably cache this
+        if self.previous is not None:
+            return self.downsamples * self.previous.total_downsampling
+        else:
+            return self.downsamples
+
+    @property
+    def total_padding(self):
+        # should probably cache this
+        if self.previous is not None:
+            prev_lost = self.previous.total_padding
+            return Lost(top=self.padding.top + prev_lost.top * self.downsamples[0],
+                        left=self.padding.left + prev_lost.left * self.downsamples[1],
+                        bottom=self.padding.bottom + prev_lost.bottom * self.downsamples[0],
+                        right=self.padding.right + prev_lost.right * self.downsamples[1])
+        else:
+            return self.padding
+
+    @property
+    def total_output_lost(self):
+        # should probably cache this
+        if self.previous is not None:
+            prev_lost = self.previous.total_output_lost
+            return Lost(top=self.output_lost.top + prev_lost.top * self.downsamples[0],
+                        left=self.output_lost.left + prev_lost.left * self.downsamples[1],
+                        bottom=self.output_lost.bottom + prev_lost.bottom * self.downsamples[0],
+                        right=self.output_lost.right + prev_lost.right * self.downsamples[1])
+        else:
+            return self.output_lost
+
+    def total_gradient_lost(self):
+        # should probably cache this
+        if self.previous is not None:
+            prev_lost = self.previous.gradient_lost
+            return Lost(top=self.gradient_lost.top + prev_lost.top * self.downsamples[0],
+                        left=self.gradient_lost.left + prev_lost.left * self.downsamples[1],
+                        bottom=self.gradient_lost.bottom + prev_lost.bottom * self.downsamples[0],
+                        right=self.gradient_lost.right + prev_lost.right * self.downsamples[1])
+        else:
+            return self.gradient_lost
+
+    def trim_to_valid_output(self, output, tile):
+        # Deal with padding
+        #
+        padding = self.total_padding
+        pad_left = padding.left
+        pad_right = padding.right
+        pad_top = padding.top
+        pad_bottom = padding.bottom
+
+        if tile.sides.left:
+            pad_left = 0
+            pad_right += padding.left
+        if tile.sides.top:
+            pad_top = 0
+            pad_bottom += padding.top
+        if tile.sides.right:
+            pad_left = padding.left
+            pad_right = 0
+        if tile.sides.bottom:
+            pad_top = padding.top
+            pad_bottom = 0
+
+        output = output[:, :,
+                        int(pad_left):int(output.shape[2] - pad_right),
+                        int(pad_top):int(output.shape[3] - pad_bottom)]
+
+        return output, Lost(pad_top, pad_left, pad_bottom, pad_right)
+
+    def trim_to_valid_gradient(self, gradient, tile):
+        total_grad = self.total_gradient_lost
+        print(total_grad)
+
 
 class StreamingSGD(object):
     """
@@ -17,52 +200,50 @@ class StreamingSGD(object):
     def __init__(self, model):
         self.model = model
 
-    def configure(self, layers, stop_index, input_shape, divide_in, cuda=False, verbose=False):
+    def configure(self, stream_to_layer, input_shape, divide_in, cuda=False, verbose=False):
         """Configures the class
 
         Function calculates the coordinates of the forward and backward tiles.
 
         Args:
-            layers: modules of the model
-            stop_index: An index of layers indicating which layer we will switch to normal SGD
+            stream_to_layer: An identifier of the layer indicating which layer we will switch to normal SGD
             input_shape: A shape (batch, channels, height, width) the model will be trained with
             divide_in: An integer indicating how many tiles the feature map will be divided in
             cuda: Optional argument (default is False), set to True if using cuda
             verbose: Optional argument, enable logging
         """
         self._input_size = input_shape
-        self._layers = layers
-        self._stop_index = stop_index
+        self._stream_to_layer = stream_to_layer
         self._divide_in = divide_in
         self._cuda = cuda
         self._verbose = verbose
         self._batch = False
+        self._tree = self._create_sequential_tree(input_shape)
 
         if self._verbose:
-            print("Calculating patch boxes...")
+            [print(value.output_shape, key) for key, value in self._tree.items()]
 
-        # Calculate overlap / pixels lost per layer
-        #
-        self._full_output_lost = self._getreconstructioninformation(self._layers[:self._stop_index],
-                                                                    input_shape=(1, input_shape[2], input_shape[0], input_shape[1]))
-
-        # We keep track of the gradient sizes to check if we reconstruct all of it
-        #
-        self._gradient_sizes = self._calculate_gradient_sizes(self._full_output_lost, self._input_size, self._stop_index)
+        if self._verbose:
+            print("Calculating tile boxes...")
 
         # Precalculate the coordinates of the tiles in the forward pass
         #
-        self._forward_patches_c, self._output_size, self._map_coords = self._forward_patches_coords()
+        self._forward_tiles, self._map_coords = self._calculate_tile_boxes()
+
+        if self._verbose:
+            [print(box) for box in self._forward_tiles]
 
         # Precalculate the coordinates of the tiles in the backward pass
         #
-        self._back_patches, self._grad_map_coords, self._patch_output_lost = self._backward_patches_coords()
-        # print(self._back_patches)
+        self._back_tiles, self._grad_map_coords = self._calculate_tile_boxes(backwards=True)
 
         if self._verbose:
-            print("Patch size forward:", (self._forward_patches_c[0][1][1], self._forward_patches_c[0][1][3]), "\n")
-            print("Calculating gradient. Embedding size:", self._gradient_sizes[-1])
-            print("Done. \nBackward patch size (for forward pass):", (self._back_patches[0][1][1], self._back_patches[0][1][3]))
+            [print(box) for box in self._back_tiles]
+
+        if self._verbose:
+            print("Tile size forward:", (self._forward_tiles[0].height, self._forward_tiles[0].width))
+            # print("Calculating gradient. Embedding size:", self._gradient_sizes[-1])
+            print("Tile size backward (for forward pass):", (self._back_tiles[0].height, self._back_tiles[0].width))
 
             # These memory reduction calculations are incorrect
             # We should also think about channels
@@ -110,291 +291,55 @@ class StreamingSGD(object):
         relevant_grads, full_gradients = self._backward_patches(image[None], grad_embedding, fill_gradients)
         return full_gradients
 
-    def _valid_grads_with_input(self, output_lost, start_index, sides=(0, 0, 0, 0)):
-        """
-        This function gives 'crop' boxes for the gradients indicating which parts are valid gradients
-        (meaning would be the same as in the full image)
-        """
-        valid_boxes = []
-        v_x = 0
-        v_y = 0
-        v_w = 0
-        v_h = 0
-
-        p_x = 0
-        p_y = 0
-        p_w = 0
-        p_h = 0
-
-        prev_down = output_lost[1][-1]
-
-        # Deal with padding
-        #
-        padding = self._patch_output_lost[3][self._stop_index - 1].int()
-        p_x = padding[0]
-        p_w = padding[2]
-        p_y = padding[1]
-        p_h = padding[3]
-
-        if sides[0]:  # left
-            p_x = 0
-            p_w = padding[0] + padding[2]
-        if sides[1]:  # top
-            p_y = 0
-            p_h = padding[1] + padding[3]
-        if sides[2]:  # right
-            p_x = padding[0]
-            p_w = 0
-        if sides[3]:  # bottom
-            p_y = padding[1]
-            p_h = 0
-
-        valid_boxes.append((p_y, p_h, p_x, p_w))
-
-        for i in range(len(output_lost[0]) - 1):
-            grad_padding = output_lost[3][-(i + 1)].clone()
-            grad_lost = output_lost[0][-(i + 1)].clone()
-
-            grad_lost = (grad_lost * 2)
-            grad_down = output_lost[1][-(i + 2)]
-
-            factor = prev_down / grad_down
-
-            grad_lost[0:2] /= grad_down
-            grad_lost[2:] /= grad_down
-
-            # grad_padding[0:2] /= factor
-            # grad_padding[2:] /= factor
-
-            v_x *= factor[0]
-            v_w *= factor[0]
-            v_y *= factor[1]
-            v_h *= factor[1]
-
-            v_x += grad_lost[0]
-            v_w += grad_lost[1]
-            v_y += grad_lost[2]
-            v_h += grad_lost[3]
-
-            p_x = grad_padding[0]
-            p_w = grad_padding[2]
-            p_y = grad_padding[1]
-            p_h = grad_padding[3]
-
-            if sides[0] == 1:
-                v_x = 0
-                p_x = 0
-                p_w = grad_padding[2]
-            if sides[1] == 1:
-                v_y = 0
-                p_y = 0
-                p_h = grad_padding[3]
-            if sides[2] == 1:
-                v_w = 0
-                p_x = grad_padding[0]
-                p_w = 0
-            if sides[3] == 1:
-                v_h = 0
-                p_y = grad_padding[1]
-                p_h = 0
-
-            prev_down = grad_down
-            valid_boxes.append((int(v_y + p_y), int(v_h + p_h), int(v_x + p_x), int(v_w + p_w)))
+    def _calculate_tile_boxes(self, backwards=False):
         # print(valid_boxes)
-
-        return valid_boxes
-
-    def _valid_gradients(self, patch, patch_embedding_grad, stop_index, output_lost, sides):
         """
-        This function performs the backward pass (and the partial forward pass to
-        reconstruct the intermediate activations) and crops the gradients.
-        """
-
-        # Do partial forward pass and backward pass
-        #
-        patch_output = self.model.forward(patch, stop_index=stop_index, detach=True)
-        self.model.backward(gradient=patch_embedding_grad)
-        patch_gradients = [gradient for gradient in self.model.gradients]
-
-        # Calculate cropbox for gradients
-        #
-        valid_gradients_loss = self._valid_grads_with_input(output_lost, stop_index, sides=sides)
-
-        # Fetch the outputs of the patches
-        #
-        patch_outputs = [output for output in self.model.output]
-
-        # List with the cropped gradients
-        #
-        correct = []
-        # print(sides, valid_gradients_loss)
-        for index in range(len(patch_gradients)):
-            if index == 0:
-                # grad_padding = output_lost[3][-1]
-
-                # p_x = grad_padding[0]
-                # p_w = grad_padding[2]
-                # p_y = grad_padding[1]
-                # p_h = grad_padding[3]
-
-                # if sides[0] == 1:
-                #     p_x = 0
-                #     p_w = grad_padding[2]
-                # if sides[1] == 1:
-                #     p_y = 0
-                #     p_h = grad_padding[3]
-                # if sides[2] == 1:
-                #     p_x = grad_padding[0]
-                #     p_w = 0
-                # if sides[3] == 1:
-                #     p_y = grad_padding[1]
-                #     p_h = 0
-
-                # g_lost = [int(p_y), int(p_h), int(p_x), int(p_w)]
-
-                g_lost = [0, 0, 0, 0]
-
-            # else:
-                # Fetch gradient 'lost' in this layer
-                #
-
-            g_lost = valid_gradients_loss[index]
-
-            # Crop the gradient
-            #
-            p_grad = patch_gradients[index]
-            # print(index, p_grad.shape, g_lost)
-            p_grad = p_grad[:, :,
-                            g_lost[0]:p_grad.shape[2] - g_lost[1],
-                            g_lost[2]:p_grad.shape[3] - g_lost[3]]
-
-            # Crop the output
-            #
-            patch_output = patch_outputs[-(index + 1)]
-            patch_outputs[-(index + 1)] = patch_output[:, :,
-                                                       g_lost[0]:patch_output.shape[2] - g_lost[1],
-                                                       g_lost[2]:patch_output.shape[3] - g_lost[3]]
-
-            # print("new shape:", p_grad.shape)
-            correct.append(p_grad)
-
-        return correct, patch_outputs, valid_gradients_loss
-
-    def _forward_patches_coords(self):
-        """
-        This function calculates the coordinates of the patches / tiles needed
+        This function calculates the coordinates of the tiles needed
         for the forward pass to reconstruct the feature map
         """
+        last_layer_stats = self._tree[self._stream_to_layer]
+        total_padding = last_layer_stats.total_padding
+        output_shape = last_layer_stats.output_shape
+        output_tile_shape = IOShape(batch=0, channels=0,
+                                    height=output_shape.height // self._divide_in + total_padding.top + total_padding.bottom,
+                                    width=output_shape.width // self._divide_in + total_padding.left + total_padding.right)
 
-        # Sum the padding / output lost over the whole streaming part of the network
-        #
-        lost = torch.stack(self._full_output_lost[0])[0:self._stop_index].sum(dim=0).int()
-        padding = torch.stack(self._full_output_lost[2])[0:self._stop_index].sum(dim=0).int()
-
-        # Fetch the last downsampling
-        #
-        down = self._full_output_lost[1][self._stop_index - 1].int()
-
-        # With the lost + down it is possible to calculate the output_size
-        # (= size of feature map to be reconstructed)
-        # TODO: _getreconstructioninformation knows this info, no need to recalculate
-        #
-        output_size = ((self._input_size[0] - lost[0] - lost[1] + padding[0] * 2) // down[0],
-                       (self._input_size[1] - lost[2] - lost[3] + padding[1] * 2) // down[1])
+        tile_shape = output_tile_shape
+        total_downsamples = last_layer_stats.total_downsampling
+        tile_shape = last_layer_stats.calculate_input_shape(tile_shape, valid=True, recursive=True, gradient_lost=backwards)
 
         # The size of the patch/tile is feature map / divide_in
         #
-        patch_size = (output_size[0] // self._divide_in, output_size[1] // self._divide_in)
-        if output_size[0] % self._divide_in > 0 or output_size[1] % self._divide_in > 0:
-            print("Check size of tiles:!", output_size[0], "px , division asked not possible:", self._divide_in)
+        if output_shape.width % self._divide_in > 0 or output_shape.height % self._divide_in > 0:
+            print("Check size of tiles:!", output_shape, " division asked not possible:", self._divide_in)
 
         if self._verbose:
-            print("Embedding divided in tile sizes:", patch_size, "\n")
+            print("Embedding divided in tile sizes:", output_tile_shape, "\n")
 
-        padding = self._full_output_lost[3][self._stop_index - 1].int()
-
-        # new_output_lost = self._getreconstructioninformation(self.model.layers[:self._stop_index],
-        #                                                      input_shape=(1, self._input_size[2],
-        #                                                                   int(patch_size[1] + padding[1] + padding[3]),
-        #                                                                   int(patch_size[0] + padding[0] + padding[2])),
-        #                                                      stop_index=self._stop_index)
-        # set_trace()
-
-        # if not (torch.stack(self._full_output_lost[0])[:self._stop_index] ==
-        #         torch.stack(new_output_lost[0])).all():
-
-        #     print("!!!! Output lost error!")
-
-        #     for li, l in enumerate(new_output_lost[0]):
-        #         print("tile:", l.tolist(), "img:",  self._full_output_lost[0][li].tolist())
-
-        embedding_coords = []
-        boxes = []
-        for y in range(0, output_size[1], patch_size[1]):
-            for x in range(0, output_size[0], patch_size[0]):
-                # Calculate which part of the full image we need for this part of the feature map
-                # and take padding into account
-                #
-                padding = self._full_output_lost[3][self._stop_index - 1].int()
-                p_x = max(x - padding[0], 0)
-                p_y = max(y - padding[1], 0)
-
-                p_w = patch_size[0]
-                p_h = patch_size[1]
-
-                # set_trace()
-                box = self._input_box_for_output((p_x, p_y, p_w, p_h), self._full_output_lost, self._stop_index)
-
-                # TODO: CHECK THIS!
-                box = (box[0], box[1] + padding[2], box[2], box[3] + padding[3])
+        tile_boxes = []
+        embed_boxes = []
+        for y in range(0, int(output_shape.height), int(output_tile_shape.height)):
+            for x in range(0, int(output_shape.width), int(output_tile_shape.width)):
+                padding = last_layer_stats.padding
+                embed_x = max(x - padding.left, 0)
+                tile_x = embed_x * total_downsamples[1]
+                embed_y = max(y - padding.top, 0)
+                tile_y = embed_y * total_downsamples[0]
 
                 # Keep track if we are at the sides (because we shouldn't crop the output here)
                 #
-                sides = [0, 0, 0, 0]  # left - top - right - bottom
-                sides[0] = 1 if x == 0 else 0
-                sides[2] = 1 if x + patch_size[0] >= output_size[0] else 0
-                sides[1] = 1 if y == 0 else 0
-                sides[3] = 1 if y + patch_size[1] >= output_size[1] else 0
+                sides = Sides(left=(x == 0), top=(y == 0),
+                              right=(tile_x + tile_shape.width >= output_shape.width),
+                              bottom=(tile_y + tile_shape.height >= output_shape.height))
 
-                embedding_coords.append((y, int(y + patch_size[1]), x, int(x + patch_size[0])))
-                boxes.append((sides, box))
+                tile_box = Box(tile_y, tile_shape.height, tile_x, tile_shape.width, sides)
+                embed_box = Box(embed_y, output_tile_shape.height, embed_x, output_tile_shape.width, sides)
 
-        return boxes, output_size, embedding_coords
+                tile_boxes.append(tile_box)
+                embed_boxes.append(embed_box)
 
-    def _output_box_for_input(self, input_coords, output_lost, stop_index):
-        """
-        This function calculates the coordinates of the feature map for a given input box
-        """
-        lost = torch.stack(output_lost[0])[0:stop_index].sum(dim=0).int()
-        down = output_lost[1][stop_index - 1].int()
-        padding = self._full_output_lost[3][self._stop_index - 1].int()
-
-        # We always need a multiple of downsampling, otherwise downsampling layers
-        # will not begin in the correct corner for example with down = 2,
-        # we will want index 0 or index 2 of an image, index 1 will give wrong results
-        #
-        p_x = input_coords[0] / down[0]
-        p_y = input_coords[1] / down[1]
-        p_w = math.ceil((input_coords[2] - lost[0] - lost[1]) / down[0]) + padding[0] + padding[2]
-        p_h = math.ceil((input_coords[3] - lost[3] - lost[2]) / down[1]) + padding[1] + padding[3]
-
-        # top bottom left right
-        return (int(p_y), int(p_y + p_h), int(p_x), int(p_x + p_w))
-
-    def _input_box_for_output(self, output_coords, output_lost, stop_index):
-        """
-        This function calculates the coordinates of the input for a given feature map box
-        """
-        lost = torch.stack(output_lost[0])[0:stop_index].sum(dim=0).int()
-        down = output_lost[1][stop_index - 1].int()
-        padding = self._full_output_lost[3][self._stop_index - 1].int()
-
-        p_x = output_coords[0] * down[0]
-        p_y = output_coords[1] * down[1]
-        p_w = (output_coords[2]) * down[0] + lost[0] + lost[1]
-        p_h = (output_coords[3]) * down[1] + lost[2] + lost[3]
-
-        return (p_y, p_y + p_h, p_x, p_x + p_w)  # top bottom left right
+        # TODO: re-add output_lost check?
+        return tile_boxes, embed_boxes
 
     def _forward_patches(self, image):
         """
@@ -403,61 +348,39 @@ class StreamingSGD(object):
         """
         feature_map = None
         if self._verbose:
-            iterator = tqdm(enumerate(self._forward_patches_c), total=len(self._forward_patches_c))
+            iterator = tqdm(enumerate(self._forward_tiles), total=len(self._forward_tiles))
         else:
-            iterator = enumerate(self._forward_patches_c)
+            iterator = enumerate(self._forward_tiles)
 
         # Reconstruct the feature map patch by patch
         #
-        for i, patch in iterator:
-            coords = patch[1]
-            sides = patch[0]
+        for i, tile in iterator:
             map_c = self._map_coords[i]
 
             # Fetch the relevant part of the full image
             #
-            data = image[:, :, coords[0]:coords[1], coords[2]:coords[3]].clone()  # not sure if we need clone here?
+            # TODO: try to remove ints in pytorch 0.4
+            data = image[:, :,
+                         int(tile.y):int(tile.y + tile.height),
+                         int(tile.x):int(tile.x + tile.width)].clone()  # not sure if we need clone here?
             data.volatile = True
+
             if self._cuda:
                 data = data.cuda()
 
             # Do the actual forward pass
             #
-            patch_output = self.model.forward(data, self._stop_index, detach=False)
-
-            # Deal with padding
-            #
-            padding = self._patch_output_lost[3][self._stop_index - 1].int()
-            p_x = padding[0]
-            p_w = padding[2]
-            p_y = padding[1]
-            p_h = padding[3]
-
-            if sides[0]:  # left
-                p_x = 0
-                p_w = padding[0] + padding[2]
-            if sides[1]:  # top
-                p_y = 0
-                p_h = padding[1] + padding[3]
-            if sides[2]:  # right
-                p_x = padding[0]
-                p_w = 0
-            if sides[3]:  # bottom
-                p_y = padding[1]
-                p_h = 0
-
-            patch_output = patch_output[:, :,
-                                        p_y:patch_output.shape[2] - p_h,
-                                        p_x:patch_output.shape[3] - p_w]
-
-            c = patch_output.shape[1]
+            output = self.model.forward(data, self._stream_to_layer, detach=False)
+            tile_output, trimmed = self._tree[self._stream_to_layer].trim_to_valid_output(output, tile)
+            output_size = self._tree[self._stream_to_layer].output_shape
 
             # Create (to be reconstructed) feature_map placeholder variable if it doesn't exists yet
             #
             if feature_map is None:
-                feature_map = torch.autograd.Variable(torch.FloatTensor(1, c,
-                                                                        int(self._output_size[1]),
-                                                                        int(self._output_size[0])))
+                feature_map = torch.autograd.Variable(torch.FloatTensor(1,
+                                                                        int(output_size.channels),
+                                                                        int(output_size.height),
+                                                                        int(output_size.width)))
                 if isinstance(data.data, torch.DoubleTensor):
                     feature_map = feature_map.double()
 
@@ -466,8 +389,11 @@ class StreamingSGD(object):
 
             # Save the output of the network in the relevant part of the feature_map
             #
-            feature_map[:, :, map_c[0]:map_c[1], map_c[2]:map_c[3]] = patch_output
-            patch_output = None  # trying memory management
+            feature_map[:, :,
+                        int(map_c.y):int(map_c.y + map_c.height),
+                        int(map_c.x):int(map_c.x + map_c.width)] = tile_output
+
+            tile_output = None  # trying memory management
 
         # From the feature map on we have to be able to generate gradients again
         #
@@ -476,31 +402,13 @@ class StreamingSGD(object):
 
         # Run reconstructed feature map through the end of the network
         #
-        final_output = self.model.forward(feature_map, start_index=self._stop_index)
+        final_output = self.model.forward(feature_map, start_index=self._stream_to_layer)
 
         return final_output, feature_map
 
-    def _calculate_gradient_sizes(self, output_lost, input_size, stop_index):
-        """
-        This utility function calculates the size of the gradients per layer
-        (basically equals output size)
-        """
-        sizes = []
-        size = input_size
-        prev_down = torch.FloatTensor([1., 1.])
-        for i in range(stop_index):
-            down = output_lost[1][i] / prev_down
-            padding = output_lost[2][i].clone()
-            lost = (output_lost[0][i]).clone()
-            padding /= output_lost[1][i]
-            lost[0:2] /= output_lost[1][i]
-            lost[2:] /= output_lost[1][i]
-            size = ((size[0] - lost[0] - lost[1] + padding[0] * 2) // down[0],
-                    (size[1] - lost[2] - lost[3] + padding[1] * 2) // down[1])
-            sizes.append(size)
-            prev_down = output_lost[1][i]
-
-        return sizes
+    def fill_tensor(self, data, data_location, already_filled):
+        # make relevant_gradient method more generalizable (could also be used for output in forward pass!
+        return
 
     def _relevant_gradients(self, gradients, targed_map_coords, grad_crop_box, outputs, filled_grad_coords, fill_gradients=False, full_gradients=None):
         """
@@ -686,6 +594,7 @@ class StreamingSGD(object):
             if c_coord[1] > 0:
                 c_coord[1] -= c_padding[0]
             ####################
+
             # If we want to return the reconstructed input gradients to each layer, save them here
             #
             if fill_gradients:
@@ -720,158 +629,6 @@ class StreamingSGD(object):
         else:
             return rel_gradients, filled_grad_coords, None
 
-    def _backward_patches_coords(self):
-        """
-        This function calculates the coordinates of the patches / tiles needed
-        for the backward pass to reconstruct the relevant activations
-        """
-        # Calculate forward patch sizes for gradient checkpointing
-        #
-        # NOTE: output lost * 2 is not always correct,
-        # if we loose pixels due to the kernel
-        # not fitting perfectly of the whole image we also multiply those.
-        # This propably results in bigger input patches than needed.
-        # Due to deadlines we leave it like this for now.
-        #
-        box_size = [int(math.ceil(self._output_size[0] / self._divide_in)),
-                    int(math.ceil(self._output_size[1] / self._divide_in))]
-
-        # The first layer overlap
-        #
-        first_lost = self._full_output_lost[0][0]
-        first_pad = self._full_output_lost[2][0]
-
-        # This loop does the actual calculation,
-        # there is probably an easier approach than looping here.
-        #
-        size = torch.FloatTensor([box_size[0], box_size[1]])
-        padding = self._full_output_lost[3][-1].clone()
-        prev_down = self._full_output_lost[1][-1]
-        for i in range(len(self._full_output_lost[0]) - 1):
-            grad_lost = self._full_output_lost[0][-(i + 1)].clone()
-            padding = self._full_output_lost[2][-(i + 1)].clone()
-
-            # We lose twice the amount of valid gradient (see paper)
-            #
-            grad_lost = (grad_lost * 2)
-            # padding = (padding * 2)
-
-            # Keep track of downsampling factor
-            #
-            grad_down = self._full_output_lost[1][-(i + 1)]
-
-            factor = prev_down / grad_down
-            size *= factor
-
-            grad_lost[0:2] /= grad_down
-            grad_lost[2:] /= grad_down
-            padding = padding / grad_down
-
-            # Sum the amount of gradient lost to the current size
-            #
-            size[0] += grad_lost[0] + grad_lost[1] + padding[1] * 2
-            size[1] += grad_lost[2] + grad_lost[3] + padding[0] * 2
-
-            prev_down = grad_down
-
-        # Since we do not need to reconstruct the gradient of the first layer
-        # we can use the normal overlap here
-        #
-        size[0] += first_lost[0] + first_lost[1]
-        size[1] += first_lost[2] + first_lost[3]
-
-        # Here we check if the convolutions fit the same between the tiles and
-        # the full input image
-        #
-        new_output_lost = self._getreconstructioninformation(self.model.layers[:self._stop_index],
-                                                             input_shape=(1, self._input_size[2], int(size[1]), int(size[0])),
-                                                             stop_index=self._stop_index)
-
-        adjust_step = 0
-        if not (torch.stack(self._full_output_lost[0])[:self._stop_index] == torch.stack(new_output_lost[0])).all():
-            print("!!!! New patch size has different output overlap profile. This could cause problems",
-                  "with required patch sizes. Further testing needed.")
-
-            full_output_arr = self._full_output_lost[0][:self._stop_index]
-            patch_output_arr = new_output_lost[0]
-            diff_c = torch.nonzero(torch.stack(full_output_arr) != torch.stack(patch_output_arr))[0]
-            max_diff = 0
-            for c in diff_c:
-                diff = torch.max(patch_output_arr[c] - full_output_arr[c])
-                diff *= torch.max(torch.stack(self._full_output_lost[1])[c])
-                if diff > max_diff:
-                    max_diff = diff
-
-            print("!! We are losing", max_diff, "px information of the input image because of different amount of pixels lost.")
-
-            for li, l in enumerate(new_output_lost[0]):
-                print("tile:", l.tolist(), "img:",  self._full_output_lost[0][li].tolist())
-
-            # TODO: Test this better
-            # We need to add a certain margin because output lost can differ and
-            # thus we can miss edges of gradient
-            #
-            adjust_step = 1  # we should be able to calculate this, but for now assume 1 extra pixel for embedding
-
-        size = [int(s) for s in size]
-        lost = torch.stack(new_output_lost[0])[1:self._stop_index].sum(dim=0).int()
-        # padding = torch.stack(new_output_lost[2])[1:self._stop_index].sum(dim=0).int()
-
-        first_lost = new_output_lost[0][0]
-
-        patches = []
-        grad_embedding_coords = []
-        down = new_output_lost[1][self._stop_index - 1].int()
-        for y in range(0, self._output_size[1], box_size[1] - adjust_step):
-            for x in range(0, self._output_size[0], box_size[0] - adjust_step):
-                # Adjust the x and y with the total amount lost at the x and y
-                # This would be the coordinates of the tile
-                #
-                padding = self._full_output_lost[3][self._stop_index - 1].int()
-
-                p_x = x * down[0] - lost[0] - padding[0] - padding[2]
-                p_y = y * down[1] - lost[2] - padding[1] - padding[3]
-
-                p_x = (x - math.ceil(lost[0] / down[0]) - padding[0]) * down[0]
-                p_y = (y - math.ceil(lost[2] / down[1]) - padding[1]) * down[1]
-
-                p_w = size[0]
-                p_h = size[1]
-
-                # test_w = (math.ceil(lost[0] / down[0]) + padding[0]) * down[0]
-
-                # set_trace()
-                # if p_x + test_w == 0:
-                #     continue
-                # if p_y + test_w == 0:
-                #     continue
-
-                # We need to keep track which tiles are on the edge,
-                # since we shouldn't crop gradients there.
-                #
-                sides = [0, 0, 0, 0]  # left - top - right - bottom
-                if p_x <= 0:
-                    p_x = 0
-                    sides[0] = 1
-                if p_x + p_w >= self._input_size[0]:
-                    sides[2] = 1
-                    p_x = self._input_size[0] - p_w
-                if p_y <= 0:
-                    p_y = 0
-                    sides[1] = 1
-                if p_y + p_h >= self._input_size[1]:
-                    sides[3] = 1
-                    p_y = self._input_size[1] - p_h
-
-                # Calculate coordinates of the feature map of this tile
-                #
-                grad_embed = self._output_box_for_input((p_x, p_y, p_w, p_h), new_output_lost, self._stop_index)
-                grad_embedding_coords.append((grad_embed, (grad_embed[0], grad_embed[2])))
-
-                patches.append((sides, (p_y, p_y + p_h, p_x, p_x + p_w)))
-
-        return patches, grad_embedding_coords, new_output_lost
-
     def _backward_patches(self, image, feature_map, fill_gradients=False):
         """
         This function is responsible for doing the backward pass per tile
@@ -885,60 +642,47 @@ class StreamingSGD(object):
             self._zero_gradient()
 
         if self._verbose:
-            iterator = tqdm(enumerate(self._back_patches), total=len(self._back_patches))
+            iterator = tqdm(enumerate(self._back_tiles), total=len(self._back_tiles))
         else:
-            iterator = enumerate(self._back_patches)
+            iterator = enumerate(self._back_tiles)
 
-        for i, (sides, coords) in iterator:
+        for i, tile in iterator:
             self._save_gradients()
 
             # Extract the tile
             #
-            # print("coords", coords)
-            patch = image[:, :, coords[0]:coords[1], coords[2]:coords[3]].clone()  # TODO: test if clone() here is needed
+            data = image[:, :,
+                         int(tile.y):int(tile.y + tile.height),
+                         int(tile.x):int(tile.x + tile.width)].clone()  # TODO: test if clone() here is needed
 
             if self._cuda:
-                patch = patch.cuda()
+                data = data.cuda()
 
             # Get the relevant part of the feature map for this tile
             #
-            map_c = self._grad_map_coords[i][0]
-            patch_map_grad = feature_map[:, :, map_c[0]:map_c[1], map_c[2]:map_c[3]].clone()  # TODO: test if clone() here is needed
+            map_c = self._grad_map_coords[i]
+            tile_map_grad = feature_map[:, :,
+                                        int(map_c.y):int(map_c.y + map_c.height),
+                                        int(map_c.x):int(map_c.x + map_c.width)].clone()  # TODO: test if clone() here is needed
 
-            # Do the actual partial forward pass and backward pass of the tile
+            # Do partial forward pass and backward pass
+            # Hooks will be used to fetch relevant gradients / outputs
             #
-            val_gradients, outputs, grads_crop_boxes = self._valid_gradients(patch,
-                                                                             patch_map_grad,
-                                                                             self._stop_index,
-                                                                             self._patch_output_lost,
-                                                                             sides)
+            self.model.forward(data, stop_index=self._stream_to_layer)
+            self.model.backward(gradient=tile_map_grad)
 
-            # The coordinates of the reconstructed gradients w.r.t. the original input gradients
-            #
-            current_grad_pos = self._grad_map_coords[i][1]
-
-            # Extract the relevant parts of the gradients
-            #
-            rel_grads, filled_grad_coords, full_gradients = self._relevant_gradients(val_gradients,
-                                                                                     current_grad_pos,
-                                                                                     grads_crop_boxes,
-                                                                                     outputs,
-                                                                                     filled_grad_coords,
-                                                                                     fill_gradients=fill_gradients,
-                                                                                     full_gradients=full_gradients)
-            self._restore_gradients()
+            # self._restore_gradients() TODO: restore gradient should be layer based
 
             # Redo backward pass with the relevant parts of the gradient
             #
-            self._apply_gradients(rel_grads)
+            # self._apply_gradients() TODO: apply gradient should be layer based
 
             # Needed for memory control
             #
-            del rel_grads
-            del val_gradients
-            del outputs
-            del patch
-            del patch_map_grad
+            del self._gradients
+            del self._outputs
+            del data
+            del tile_map_grad
 
         if self._batch:
             self._sum_batch_gradients()
@@ -966,7 +710,7 @@ class StreamingSGD(object):
     #
     def _zero_gradient(self):
         """Zeros all the gradients of all the streaming Conv2d layers"""
-        for i, layer in enumerate(self.model.layers[:self._stop_index]):
+        for key, layer in self._tree.items():
             if isinstance(layer, torch.nn.Conv2d):
                 if layer.weight.grad is not None:
                     layer.weight.grad.data.zero_()
@@ -974,35 +718,32 @@ class StreamingSGD(object):
 
     def _save_gradients(self):
         """Save all the gradients of all the streaming Conv2d layers"""
-        self._saved_gradients = []
-        for i, layer in enumerate(self.model.layers[:self._stop_index]):
+        self._saved_gradients = {}
+        for key, layer in self._tree.items():
             if isinstance(layer, torch.nn.Conv2d):
                 if layer.weight.grad is not None:
-                    self._saved_gradients.append((layer.weight.grad.data.clone(),
-                                                  layer.bias.grad.data.clone()))
+                    self._saved_gradients[key] = (layer.weight.grad.data.clone(),
+                                                  layer.bias.grad.data.clone())
 
     def _save_batch_gradients(self):
         """Save the valid batch gradients"""
         self._saved_batch_gradients = []
-        for i, layer in enumerate(self.model.layers[:self._stop_index]):
+        for key, layer in self._tree.items():
             if isinstance(layer, torch.nn.Conv2d):
                 if layer.weight.grad is not None:
-                    self._saved_batch_gradients.append((layer.weight.grad.data.clone(),
-                                                        layer.bias.grad.data.clone()))
+                    self._saved_batch_gradients[key] = (layer.weight.grad.data.clone(),
+                                                        layer.bias.grad.data.clone())
 
     def _restore_gradients(self):
         """Restore the saved valid Conv2d gradients"""
-        j = -1
-        for i, layer in enumerate(self.model.layers[:self._stop_index]):
+        for key, layer in self._tree.items():
             if isinstance(layer, torch.nn.Conv2d):
-                j += 1
                 if layer.weight.grad is not None:
                     layer.weight.grad.data.fill_(0)
                     layer.bias.grad.data.fill_(0)
 
                     if len(self._saved_gradients) > 0:
-                        gradient_tuple = self._saved_gradients[j]
-
+                        gradient_tuple = self._saved_gradients[key]
                         layer.weight.grad.data += gradient_tuple[0]
                         layer.bias.grad.data += gradient_tuple[1]
 
@@ -1011,12 +752,10 @@ class StreamingSGD(object):
         if len(self._saved_batch_gradients) == 0:
             return
 
-        j = -1
-        for i, layer in enumerate(self.model.layers[:self._stop_index]):
+        for key, layer in self._tree.items():
             if isinstance(layer, torch.nn.Conv2d):
-                j += 1
                 if layer.weight.grad is not None:
-                    gradient_tuple = self._saved_batch_gradients[j]
+                    gradient_tuple = self._saved_batch_gradients[key]
                     layer.weight.grad.data += gradient_tuple[0]
                     layer.bias.grad.data += gradient_tuple[1]
 
@@ -1035,7 +774,7 @@ class StreamingSGD(object):
     def end_batch(self):
         """Stop current batch and divide all conv2d gradients with number of images in batch"""
         self._batch = False
-        for i, layer in enumerate(self.model.layers):
+        for key, layer in self._tree.items():
             if isinstance(layer, torch.nn.Conv2d):
                 if layer.weight.grad is not None:
                     layer.weight.grad.data /= self._batch_count
@@ -1055,141 +794,42 @@ class StreamingSGD(object):
 
         return correct
 
-    def _getreconstructioninformation(self, layers, input_shape, stop_index=-1):
-        # TODO: we could also return the actual output sizes,
-        # could make some code in this class easier
+    # --------------------------
+    # Model layer utility functions
+    #
+    def _add_hooks():
+        return
 
-        # NOTE: lost = left right top bottom
-        # padding = left top right bottom
-        #
-        lost = []
-        padding = []
-        downsamples = []
+    def _get_layers(self, modules=None):
+        if modules is None:
+            modules = self.model.named_children()
 
-        last_shape = input_shape
+        layers = []
+        for m in modules:
+            layers.append(m)
+            try:
+                mod_layers = self._get_layers(m[1].named_children())
+                layers.extend(mod_layers)
+            except StopIteration:
+                pass
 
-        # TODO: add support for more types of layers (e.g. average layer)
-        for i, l in enumerate(layers):
-            if i == stop_index:
-                break
+        return layers
 
-            lost_this_layer = torch.FloatTensor([0, 0, 0, 0])
+    def _create_sequential_tree(self, input_shape):
+        layer_dict = dict(self._get_layers())
 
-            # For the transposed convolutions the output size increases
-            #
-            if isinstance(l, torch.nn.ConvTranspose2d):
-                # TODO: not tested
-                #
-                # Currently only valid padding with a filter_size of 2 and stride 2 is supported
-                #
-                if l.kernel_size != (2, 2):
-                    print('Filter_size not supported', str(l.kernel_size), str(l))
-                elif l.stride != (2, 2):
-                    print('Stride not supported', str(l.stride), str(l))
-
-                # A valid padding with filter size of 2 and stride of 2 results in a output size
-                # that is double the size of the input image. No pixels are lost.
-                #
-                downsamples.append(torch.FloatTensor([0.5, 0.5]))
-            elif isinstance(l, torch.nn.UpsamplingBilinear2d):
-                downsamples.append(torch.FloatTensor([0.5, 0.5]))
+        # loop through layers and do layer_stats, save in dict
+        stats = {}
+        current_shape = input_shape
+        prev_name = None
+        for name, layer in layer_dict.items():
+            stats[name] = LayerStats.stats_with_layer(layer, current_shape)
+            current_shape = stats[name].output_shape
+            if prev_name is not None:
+                stats[name].previous = stats[prev_name]
+                stats[prev_name].next = stats[name]
             else:
-                cur_stride = torch.FloatTensor(l.stride)
-                kernel_size = l.kernel_size
-                c_padding = l.padding
+                stats[name].previous = None
 
-                if isinstance(l, torch.nn.MaxPool2d):
-                    cur_stride = torch.FloatTensor([l.stride, l.stride])
-                    kernel_size = (kernel_size, kernel_size)
-                else:
-                    output_channels = l.out_channels
-
-                if isinstance(l.padding, int):
-                    c_padding = [l.padding, l.padding]
-
-                # Equations of the paper
-                #
-                lost_due_kernel_row = (kernel_size[0] - cur_stride[0]) / 2
-                lost_due_stride_row = (last_shape[2] + c_padding[0] * 2 - kernel_size[0]) % cur_stride[0]
-
-                lost_due_kernel_column = (kernel_size[1] - cur_stride[1]) / 2
-                lost_due_stride_column = (last_shape[3] + c_padding[1] * 2 - kernel_size[1]) % cur_stride[1]
-
-                p_left = math.floor(lost_due_kernel_row)
-                p_right = math.ceil(lost_due_kernel_row) + lost_due_stride_row
-
-                p_top = math.floor(lost_due_kernel_column)
-                p_bottom = math.ceil(lost_due_kernel_column) + lost_due_stride_column
-
-                lost_this_layer = torch.FloatTensor([p_left, p_right, p_top, p_bottom])
-                padding_this_layer = torch.FloatTensor([c_padding[1], c_padding[0]])
-
-                # Different way of calculating total pixels lost
-                #
-                total_lost_row = last_shape[2] - (math.floor((last_shape[2] - kernel_size[0]) / cur_stride[0]) + 1) * cur_stride[0]
-                total_lost_column = last_shape[3] - (math.floor((last_shape[3] - kernel_size[1]) / cur_stride[1]) + 1) * cur_stride[1]
-
-                # Check if reconstructions would be correct:
-                #
-                if total_lost_row != p_left + p_right or \
-                   total_lost_column != p_bottom + p_top:
-                    print("Invalid reconstruction, total lost row:", total_lost_row, "total lost column:",
-                          total_lost_column, "lost_this_layer", lost_this_layer.tolist)
-                    print("Layer info", l, "kernel size:", kernel_size, "stride", cur_stride, "last_shape", last_shape)
-
-                next_shape = [1, output_channels,
-                              last_shape[2] - p_top - p_bottom + c_padding[0] * 2,
-                              last_shape[2] - p_left - p_right + c_padding[1] * 2]
-                next_shape[2] //= cur_stride[0]
-                next_shape[3] //= cur_stride[1]
-
-                if self._verbose:
-                    print(next_shape, cur_stride.tolist(), lost_this_layer.tolist(), l.__class__.__name__)
-
-            last_shape = next_shape
-            lost.append(lost_this_layer)
-            padding.append(padding_this_layer)
-            downsamples.append(cur_stride)
-
-        # Convert to float for potential upsampling
-        #
-        downsamples = [torch.FloatTensor([float(x), float(y)]) for x, y in downsamples]
-        layer_padding = torch.FloatTensor(len(padding), 4)
-
-        c_padding = torch.FloatTensor([0, 0, 0, 0])  # left top right bottom
-        c_padding[0] += padding[0][0]
-        c_padding[1] += padding[0][1]
-        c_padding[2] += padding[0][0]
-        c_padding[3] += padding[0][1]
-
-        layer_padding[0][0] = c_padding[0]
-        layer_padding[0][1] = c_padding[1]
-        layer_padding[0][2] = c_padding[2]
-        layer_padding[0][3] = c_padding[3]
-
-        for i in range(1, len(downsamples)):
-            c_padding[0] += padding[i][0]
-            c_padding[1] += padding[i][1]
-            c_padding[2] += padding[i][0]
-            c_padding[3] += padding[i][1]
-
-            c_padding[0] = math.ceil(c_padding[0] / downsamples[i][0])
-            c_padding[1] = math.ceil(c_padding[1] / downsamples[i][1])
-            c_padding[2] = math.ceil(c_padding[2] / downsamples[i][0])
-            c_padding[3] = math.ceil(c_padding[3] / downsamples[i][1])
-
-            downsamples[i] *= downsamples[i - 1]
-            lost[i][0:2] *= downsamples[i - 1][0]
-            lost[i][2:] *= downsamples[i - 1][1]
-
-            padding[i][0] *= downsamples[i - 1][0]
-            padding[i][1] *= downsamples[i - 1][1]
-
-            layer_padding[i][0] = c_padding[0]
-            layer_padding[i][1] = c_padding[1]
-            layer_padding[i][2] = c_padding[2]
-            layer_padding[i][3] = c_padding[3]
-
-        # print(layer_padding)
-
-        return lost, downsamples, padding, layer_padding
+            prev_name = name
+        return stats
