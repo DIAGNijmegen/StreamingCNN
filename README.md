@@ -9,6 +9,8 @@ the maximum dimensions of the input data. We demonstrate a method to train
 convolutional neural networks holding only parts of the image in memory while
 giving equivalent results.
 
+**Working on refactoring the code in [develop branch](https://github.com/DIAGNijmegen/StreamingSGD/tree/develop) (should be clearer)**
+
 ### See [notebook](https://github.com/DIAGNijmegen/StreamingSGD/blob/master/SSGD%20example.ipynb) for example usage
 
 # Requirements
