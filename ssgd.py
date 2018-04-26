@@ -127,67 +127,53 @@ class LayerStats(object):
         # should probably cache this
         if self.previous is not None:
             prev_lost = self.previous.total_padding
-            return Lost(top=self.padding.top + prev_lost.top * self.downsamples[0],
-                        left=self.padding.left + prev_lost.left * self.downsamples[1],
-                        bottom=self.padding.bottom + prev_lost.bottom * self.downsamples[0],
-                        right=self.padding.right + prev_lost.right * self.downsamples[1])
+            return Lost(top=self.padding.top + prev_lost.top,
+                        left=self.padding.left + prev_lost.left,
+                        bottom=self.padding.bottom + prev_lost.bottom,
+                        right=self.padding.right + prev_lost.right)
         else:
             return self.padding
-
-    @property
-    def total_output_lost(self):
-        # should probably cache this
-        if self.previous is not None:
-            prev_lost = self.previous.total_output_lost
-            return Lost(top=self.output_lost.top + prev_lost.top * self.downsamples[0],
-                        left=self.output_lost.left + prev_lost.left * self.downsamples[1],
-                        bottom=self.output_lost.bottom + prev_lost.bottom * self.downsamples[0],
-                        right=self.output_lost.right + prev_lost.right * self.downsamples[1])
-        else:
-            return self.output_lost
 
     def total_gradient_lost(self):
         # should probably cache this
         if self.previous is not None:
             prev_lost = self.previous.gradient_lost
-            return Lost(top=self.gradient_lost.top + prev_lost.top * self.downsamples[0],
-                        left=self.gradient_lost.left + prev_lost.left * self.downsamples[1],
-                        bottom=self.gradient_lost.bottom + prev_lost.bottom * self.downsamples[0],
-                        right=self.gradient_lost.right + prev_lost.right * self.downsamples[1])
+            return Lost(top=self.gradient_lost.top + prev_lost.top,
+                        left=self.gradient_lost.left + prev_lost.left,
+                        bottom=self.gradient_lost.bottom + prev_lost.bottom,
+                        right=self.gradient_lost.right + prev_lost.right)
         else:
             return self.gradient_lost
 
-    def trim_to_valid_output(self, output, tile):
-        # Deal with padding
-        #
-        padding = self.total_padding
-        pad_left = padding.left
-        pad_right = padding.right
-        pad_top = padding.top
-        pad_bottom = padding.bottom
+    def _trim_tensor_with_lost(self, tensor, tile, lost):
+        l_left = lost.left
+        l_right = lost.right
+        l_top = lost.top
+        l_bottom = lost.bottom
 
         if tile.sides.left:
-            pad_left = 0
-            pad_right += padding.left
+            l_left = 0
+            l_right += lost.left
         if tile.sides.top:
-            pad_top = 0
-            pad_bottom += padding.top
+            l_top = 0
+            l_bottom += lost.top
         if tile.sides.right:
-            pad_left = padding.left
-            pad_right = 0
+            l_left = lost.left
+            l_right = 0
         if tile.sides.bottom:
-            pad_top = padding.top
-            pad_bottom = 0
+            l_top = lost.top
+            l_bottom = 0
 
-        output = output[:, :,
-                        int(pad_left):int(output.shape[2] - pad_right),
-                        int(pad_top):int(output.shape[3] - pad_bottom)]
+        tensor = tensor[:, :,
+                        int(l_left):int(tensor.shape[2] - l_right),
+                        int(l_top):int(tensor.shape[3] - l_bottom)]
+        return tensor, Lost(l_top, l_left, l_bottom, l_right)
 
-        return output, Lost(pad_top, pad_left, pad_bottom, pad_right)
+    def trim_to_valid_output(self, output, tile):
+        return self._trim_tensor_with_lost(output, tile, self.total_padding)
 
     def trim_to_valid_gradient(self, gradient, tile):
-        total_grad = self.total_gradient_lost
-        print(total_grad)
+        return self._trim_tensor_with_lost(gradient, tile, self.total_gradient_lost)
 
 
 class StreamingSGD(object):
