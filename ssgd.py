@@ -206,6 +206,8 @@ class StreamingSGD(object):
         self._batch = False
         self._tree = self._create_sequential_tree(input_shape)
 
+        self._add_hooks_sequential()
+
         if self._verbose:
             [print(value.output_shape, key) for key, value in self._tree.items()]
 
@@ -720,18 +722,17 @@ class StreamingSGD(object):
                     self._saved_batch_gradients[key] = (layer.weight.grad.data.clone(),
                                                         layer.bias.grad.data.clone())
 
-    def _restore_gradients(self):
+    def _restore_gradients(self, name):
         """Restore the saved valid Conv2d gradients"""
-        for key, layer in self._tree.items():
-            if isinstance(layer, torch.nn.Conv2d):
-                if layer.weight.grad is not None:
-                    layer.weight.grad.data.fill_(0)
-                    layer.bias.grad.data.fill_(0)
+        layer = self._tree[name].layer
+        if layer.weight.grad is not None:
+            layer.weight.grad.data.fill_(0)
+            layer.bias.grad.data.fill_(0)
 
-                    if len(self._saved_gradients) > 0:
-                        gradient_tuple = self._saved_gradients[key]
-                        layer.weight.grad.data += gradient_tuple[0]
-                        layer.bias.grad.data += gradient_tuple[1]
+            if len(self._saved_gradients) > 0:
+                gradient_tuple = self._saved_gradients[name]
+                layer.weight.grad.data += gradient_tuple[0]
+                layer.bias.grad.data += gradient_tuple[1]
 
     def _sum_batch_gradients(self):
         """Sum gradients within a batch"""
@@ -745,10 +746,9 @@ class StreamingSGD(object):
                     layer.weight.grad.data += gradient_tuple[0]
                     layer.bias.grad.data += gradient_tuple[1]
 
-    def _apply_gradients(self, gradients):
+    def _apply_gradients(self, name, valid_grad):
         """Apply the relevant gradients"""
-        for i, (grad, out) in enumerate(gradients):
-            out.backward(grad)
+        self._tree[name].layer.backward(valid_grad)
 
     def start_batch(self):
         """Start a batch, this will sum all the gradients of the conv2d layers
@@ -783,8 +783,29 @@ class StreamingSGD(object):
     # --------------------------
     # Model layer utility functions
     #
-    def _add_hooks():
+    def _add_hooks_sequential(self):
+        for name, layerstats in self._get_layers():
+            if name == self._stream_to_layer:
+                break
+            layerstats.layer.register_forward_pre_hook(lambda module, input: self._forward_pre_hook(module, input, name))
+            layerstats.layer.register_forward_hook(lambda module, input, output: self._forward_hook(module, input, output, name))
+            layerstats.layer.register_backward_hook(lambda module, grad_input, grad_output: self._backward_hook(module, grad_input, grad_output, name))
         return
+
+    def _forward_pre_hook(self, module, input):
+        # detach input inplace
+        input.detach_()
+
+    def _forward_hook(self, module, input, output):
+        # we need to save the output
+        name = self._reverse_tree[module]
+        self._outputs[name] = self._tree[name].trim_to_valid_output(output, self._current_tile)
+
+    def _backward_hook(self, module, grad_input, grad_output):
+        name = self._reverse_tree[module]
+        valid_grad = self._tree[name].trim_to_valid_gradient(grad_output.clone(), self._current_tile)
+        self._restore_gradients(name)
+        self._apply_gradient(name, valid_grad)
 
     def _get_layers(self, modules=None):
         if modules is None:
@@ -818,4 +839,5 @@ class StreamingSGD(object):
                 stats[name].previous = None
 
             prev_name = name
+
         return stats
