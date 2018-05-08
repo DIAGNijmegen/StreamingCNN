@@ -3,10 +3,12 @@ Author: Hans Pinckaers
 April 11, 2018
 """
 import math
+from collections import namedtuple
+
 import torch
+
 from tqdm import tqdm
 from IPython.core.debugger import set_trace
-from collections import namedtuple
 
 # Utility named tuples, makes code more readable
 #
@@ -20,7 +22,8 @@ class Sides(namedtuple('Sides', 'left top right bottom')):
 
 class IOShape(namedtuple('IOShape', 'batch channels height width')):
     def __str__(self):
-        return '(IOShape batch:%2.1f channels:%2.1f height:%2.1f width:%2.1f)' % (self.batch, self.channels, self.height, self.width)
+        return '(IOShape batch:%2.1f channels:%2.1f height:%2.1f width:%2.1f)' % \
+            (self.batch, self.channels, self.height, self.width)
 
 class Lost(namedtuple('Lost', 'top left bottom right')):
     def __str__(self):
@@ -30,18 +33,19 @@ class LayerStats(object):
     """This class is responsible for calculating layer specific statistics,
     such as padding, output lost, gradient invalidated by convolution / zero-padding
     """
-    def __init__(self, layer, padding, output_lost, downsamples, gradient_lost, output_shape):
-        self.next = []
-        self.previous = []
+    def __init__(self, layer, padding, output_lost, downsamples, gradient_lost, output_shape, name):
+        self.next = None
+        self.previous = None
         self.padding = padding
         self.output_lost = output_lost
         self.gradient_lost = gradient_lost
         self.output_shape = output_shape
         self.downsamples = downsamples
         self.layer = layer
+        self.name = name
 
     @classmethod
-    def stats_with_layer(cls, layer, input_shape):
+    def stats_with_layer(cls, layer, input_shape, name):
         output_channels = input_shape[1]
         cur_stride = torch.FloatTensor(layer.stride)
         kernel_size = layer.kernel_size
@@ -76,7 +80,7 @@ class LayerStats(object):
 
         next_shape = [1, output_channels,
                       input_shape[2] - p_top - p_bottom + c_padding[0] * 2,
-                      input_shape[2] - p_left - p_right + c_padding[1] * 2]
+                      input_shape[3] - p_left - p_right + c_padding[1] * 2]
 
         next_shape[2] //= cur_stride[0]
         next_shape[3] //= cur_stride[1]
@@ -89,41 +93,64 @@ class LayerStats(object):
             output_lost=lost_this_layer,
             padding=padding_this_layer,
             gradient_lost=grad_lost_this_layer,
-            downsamples=downsamples
+            downsamples=downsamples,
+            name=name
         )
 
-    def calculate_input_shape(self, output_shape, valid=False, recursive=True, gradient_lost=False):
-        if not gradient_lost:
-            input_height = output_shape.height * self.downsamples[0] + self.output_lost.top + self.output_lost.bottom
-            input_width = output_shape.width * self.downsamples[1] + self.output_lost.left + self.output_lost.right
+    def calculate_input_shape(self, out_shape, valid=False, recursive=True, recursive_till="", gradient_lost=False):
+        if not gradient_lost or self.previous is None:
+            input_height = out_shape.height * self.downsamples[0] + self.output_lost.top + self.output_lost.bottom
+            input_width = out_shape.width * self.downsamples[1] + self.output_lost.left + self.output_lost.right
         else:
-            input_height = output_shape.height * self.downsamples[0] + self.gradient_lost.top + self.gradient_lost.bottom
-            input_width = output_shape.width * self.downsamples[1] + self.gradient_lost.left + self.gradient_lost.right
+            input_height = out_shape.height * self.downsamples[0] + self.gradient_lost.top + self.gradient_lost.bottom
+            input_width = out_shape.width * self.downsamples[1] + self.gradient_lost.left + self.gradient_lost.right
 
         if not valid:
             input_height -= self.padding.top + self.padding.bottom
             input_width -= self.padding.left + self.padding.right
 
-        shape = IOShape(batch=output_shape.batch,
-                        channels=output_shape.channels,
+        shape = IOShape(batch=out_shape.batch,
+                        channels=out_shape.channels,
                         height=input_height,
                         width=input_width)
 
         if recursive and self.previous is not None:
-            return self.previous.calculate_input_shape(shape, valid)
+            return self.previous.calculate_input_shape(shape, valid, (self.previous is not recursive_till),
+                                                       recursive_till, gradient_lost)
         else:
             return shape
 
-    @property
-    def total_downsampling(self):
-        # should probably cache this
-        if self.previous is not None:
-            return self.downsamples * self.previous.total_downsampling
-        else:
-            return self.downsamples
+    def calculate_output_shape(self, in_shape, output_layer):
+        # TODO: this can be wrong if output_lost would be different for this in_shape
+        next_layer = self
+        while next_layer is not None:
+            in_shape = self.stats_with_layer(next_layer.layer, in_shape, next_layer.name).output_shape
+
+            if next_layer == output_layer:
+                break
+            next_layer = next_layer.next
+
+        return in_shape
+
+    def calculate_input_coords_for_output(self, y: int, x: int, output_layer):
+        total_downsamples = output_layer.downsampling_upto(self.name)
+        tile_x = x * total_downsamples[1]
+        tile_y = y * total_downsamples[0]
+        return Box(y=max(tile_y, 0), height=0, x=max(tile_x, 0), width=0, sides=None)
 
     @property
-    def total_padding(self):
+    def total_downsampling(self) -> Lost:
+        # should probably cache this
+        return self.downsampling_until()
+
+    def downsampling_upto(self, until_layer=None):
+        if self.name == until_layer or self.previous is None:
+            return torch.FloatTensor([1., 1.])
+        else:
+            return self.downsamples * self.previous.downsampling_upto(until_layer)
+
+    @property
+    def total_padding(self) -> Lost:
         # should probably cache this
         if self.previous is not None:
             prev_lost = self.previous.total_padding
@@ -134,18 +161,39 @@ class LayerStats(object):
         else:
             return self.padding
 
-    def total_gradient_lost(self):
+    @property
+    def total_output_lost(self) -> Lost:
         # should probably cache this
         if self.previous is not None:
-            prev_lost = self.previous.gradient_lost
-            return Lost(top=self.gradient_lost.top + prev_lost.top,
-                        left=self.gradient_lost.left + prev_lost.left,
-                        bottom=self.gradient_lost.bottom + prev_lost.bottom,
-                        right=self.gradient_lost.right + prev_lost.right)
+            prev_lost = self.previous.total_output_lost
+            return Lost(top=self.output_lost.top + math.ceil(prev_lost.top / self.downsamples[0]),
+                        left=self.output_lost.left + math.ceil(prev_lost.left / self.downsamples[1]),
+                        bottom=self.output_lost.bottom + math.ceil(prev_lost.bottom / self.downsamples[0]),
+                        right=self.output_lost.right + math.ceil(prev_lost.right / self.downsamples[1]))
+        else:
+            return Lost(0, 0, 0, 0)
+
+    def total_gradient_lost(self, output_layer) -> Lost:
+        if self.name == output_layer or self.next is None:
+            return Lost(0, 0, 0, 0)
+        else:
+            return self.next._total_gradient_lost(output_layer)
+
+    def _total_gradient_lost(self, output_layer=None) -> Lost:
+        # should probably cache this
+        if self.name == output_layer:
+            return self.gradient_lost
+        elif self.next is not None:
+            next_lost = self.next._total_gradient_lost(output_layer)
+            return Lost(top=self.gradient_lost.top + next_lost.top * self.downsamples[0],
+                        left=self.gradient_lost.left + next_lost.left * self.downsamples[1],
+                        bottom=self.gradient_lost.bottom + next_lost.bottom * self.downsamples[0],
+                        right=self.gradient_lost.right + next_lost.right * self.downsamples[1])
         else:
             return self.gradient_lost
 
-    def _trim_tensor_with_lost(self, tensor, tile, lost):
+    @staticmethod
+    def _trim_tensor_with_lost(tensor, tile, lost):
         l_left = lost.left
         l_right = lost.right
         l_top = lost.top
@@ -153,27 +201,35 @@ class LayerStats(object):
 
         if tile.sides.left:
             l_left = 0
-            l_right += lost.left
+            # l_right += lost.left
         if tile.sides.top:
             l_top = 0
-            l_bottom += lost.top
+            # l_bottom += lost.top
         if tile.sides.right:
-            l_left = lost.left
+            # l_left = lost.left
             l_right = 0
         if tile.sides.bottom:
-            l_top = lost.top
+            # l_top = lost.top
             l_bottom = 0
 
         tensor = tensor[:, :,
-                        int(l_left):int(tensor.shape[2] - l_right),
-                        int(l_top):int(tensor.shape[3] - l_bottom)]
+                        int(l_top):int(tensor.shape[2] - l_bottom),
+                        int(l_left):int(tensor.shape[3] - l_right)]
         return tensor, Lost(l_top, l_left, l_bottom, l_right)
 
     def trim_to_valid_output(self, output, tile):
         return self._trim_tensor_with_lost(output, tile, self.total_padding)
 
-    def trim_to_valid_gradient(self, gradient, tile):
-        return self._trim_tensor_with_lost(gradient, tile, self.total_gradient_lost)
+    def trim_to_valid_gradient(self, gradient, output_layer, tile):
+        total_grad_lost = self.total_gradient_lost(output_layer)
+        total_padding = self.total_padding
+
+        total_lost = Lost(top=total_grad_lost.top + total_padding.top,
+                          left=total_grad_lost.left + total_padding.left,
+                          bottom=total_grad_lost.bottom + total_padding.bottom,
+                          right=total_grad_lost.right + total_padding.right)
+
+        return self._trim_tensor_with_lost(gradient, tile, total_lost)
 
 
 class StreamingSGD(object):
@@ -182,11 +238,7 @@ class StreamingSGD(object):
     until the configured layer index, after that the feature map is run normally until
     the end of the network. The same happens in de backwards pass.
     """
-
-    def __init__(self, model):
-        self.model = model
-
-    def configure(self, stream_to_layer, input_shape, divide_in, cuda=False, verbose=False):
+    def __init__(self, model, stream_to_layer, input_shape, divide_in, cuda=False, verbose=False):
         """Configures the class
 
         Function calculates the coordinates of the forward and backward tiles.
@@ -198,47 +250,61 @@ class StreamingSGD(object):
             cuda: Optional argument (default is False), set to True if using cuda
             verbose: Optional argument, enable logging
         """
-        self._input_size = input_shape
+        self.model = model
+
+        self._input_size = IOShape(*input_shape)
         self._stream_to_layer = stream_to_layer
         self._divide_in = divide_in
         self._cuda = cuda
         self._verbose = verbose
+
+        # placeholder properties for batch training
         self._batch = False
-        self._tree = self._create_sequential_tree(input_shape)
+        self._batch_count = 0
+
+        self._tree, self._reverse_tree = self._create_sequential_tree(input_shape)
+        self._first_layer = self._get_layers()[0][0]
+
+        # placeholder attributes for backprop
+        self._layer_outputs = {}
+        self._layer_inputs = {}
+        self._current_tile = None
+        self._current_fmap_tile = None
+        self._filled = {}
+        self._layer_should_detach = False
+        self._saved_gradients = {}
 
         self._add_hooks_sequential()
 
-        if self._verbose:
-            [print(value.output_shape, key) for key, value in self._tree.items()]
-
-        if self._verbose:
-            print("Calculating tile boxes...")
+        # if self._verbose:
+        #     for key, value in self._tree.items():
+        #         print(value.output_shape, key)
 
         # Precalculate the coordinates of the tiles in the forward pass
         #
         self._forward_tiles, self._map_coords = self._calculate_tile_boxes()
 
-        if self._verbose:
-            [print(box) for box in self._forward_tiles]
+        # if self._verbose:
+        #     for ftiles, mtiles in zip(self._forward_tiles, self._map_coords):
+        #         print(ftiles, mtiles)
 
         # Precalculate the coordinates of the tiles in the backward pass
         #
         self._back_tiles, self._grad_map_coords = self._calculate_tile_boxes(backwards=True)
 
-        if self._verbose:
-            [print(box) for box in self._back_tiles]
+        # if self._verbose:
+        #     for btiles, mtiles in zip(self._back_tiles, self._grad_map_coords):
+        #         print(btiles, mtiles)
 
         if self._verbose:
             print("Tile size forward:", (self._forward_tiles[0].height, self._forward_tiles[0].width))
-            # print("Calculating gradient. Embedding size:", self._gradient_sizes[-1])
             print("Tile size backward (for forward pass):", (self._back_tiles[0].height, self._back_tiles[0].width))
 
             # These memory reduction calculations are incorrect
             # We should also think about channels
             #
-            # print("*** Memory reduction of patches: {:2.1f}% ***".format(100 - self._back_patches[0][1][1]**2 / self._input_size[1]**2 * 100))
-            # print("*** Memory reduction of embedding: {:2.1f}% ***".format(
-            #    100 - (self._output_size[1]**2 * self._output_size[0]) / (self._input_size[1]**2 * self._input_size[2]) * 100))
+            print("*** Approximate memory reduction of streaming: {:2.1f}% ***".format(
+                100 - self._back_tiles[0].height**2 / self._input_size.height**2 * 100))
 
     def forward(self, image):
         """Doing the forward pass
@@ -276,11 +342,10 @@ class StreamingSGD(object):
 
         grad_embedding = torch.autograd.grad(loss, feature_map, only_inputs=False)[0]
 
-        relevant_grads, full_gradients = self._backward_patches(image[None], grad_embedding, fill_gradients)
+        full_gradients = self._backward_tiles(image[None], grad_embedding, fill_gradients)
         return full_gradients
 
     def _calculate_tile_boxes(self, backwards=False):
-        # print(valid_boxes)
         """
         This function calculates the coordinates of the tiles needed
         for the forward pass to reconstruct the feature map
@@ -289,39 +354,58 @@ class StreamingSGD(object):
         total_padding = last_layer_stats.total_padding
         output_shape = last_layer_stats.output_shape
         output_tile_shape = IOShape(batch=0, channels=0,
-                                    height=output_shape.height // self._divide_in + total_padding.top + total_padding.bottom,
-                                    width=output_shape.width // self._divide_in + total_padding.left + total_padding.right)
+                                    height=output_shape.height // self._divide_in
+                                    + total_padding.top + total_padding.bottom,
+                                    width=output_shape.width // self._divide_in
+                                    + total_padding.left + total_padding.right)
 
-        tile_shape = output_tile_shape
-        total_downsamples = last_layer_stats.total_downsampling
-        tile_shape = last_layer_stats.calculate_input_shape(tile_shape, valid=True, recursive=True, gradient_lost=backwards)
+        tile_shape = last_layer_stats.calculate_input_shape(output_tile_shape, valid=True, gradient_lost=backwards)
+        if backwards:
+            map_tile_shape = self._tree[self._first_layer].calculate_output_shape(tile_shape, output_layer=last_layer_stats)
+        else:
+            map_tile_shape = output_tile_shape
 
         # The size of the patch/tile is feature map / divide_in
         #
         if output_shape.width % self._divide_in > 0 or output_shape.height % self._divide_in > 0:
             print("Check size of tiles:!", output_shape, " division asked not possible:", self._divide_in)
 
-        if self._verbose:
-            print("Embedding divided in tile sizes:", output_tile_shape, "\n")
+        if self._verbose and not backwards:
+            print("Feature map to be reconstructed shape:", (output_shape.width, output_shape.height))
+            print("Feature map divided in tile sizes:", (map_tile_shape.width, map_tile_shape.height))
 
         tile_boxes = []
         embed_boxes = []
         for y in range(0, int(output_shape.height), int(output_tile_shape.height)):
             for x in range(0, int(output_shape.width), int(output_tile_shape.width)):
-                padding = last_layer_stats.padding
-                embed_x = max(x - padding.left, 0)
-                tile_x = embed_x * total_downsamples[1]
-                embed_y = max(y - padding.top, 0)
-                tile_y = embed_y * total_downsamples[0]
+                map_x = x - last_layer_stats.padding.left
+                map_y = y - last_layer_stats.padding.top
+
+                if backwards:
+                    map_x -= last_layer_stats.total_output_lost.left
+                    map_y -= last_layer_stats.total_output_lost.top
+
+                map_x = max(0, map_x)
+                map_y = max(0, map_y)
+
+                tile = self._tree[self._first_layer].calculate_input_coords_for_output(
+                    y=map_y, x=map_x, output_layer=last_layer_stats)
 
                 # Keep track if we are at the sides (because we shouldn't crop the output here)
                 #
                 sides = Sides(left=(x == 0), top=(y == 0),
-                              right=(tile_x + tile_shape.width >= output_shape.width),
-                              bottom=(tile_y + tile_shape.height >= output_shape.height))
+                              right=(tile.x + tile_shape.width >= self._input_size.width),
+                              bottom=(tile.y + tile_shape.height >= self._input_size.height))
 
-                tile_box = Box(tile_y, tile_shape.height, tile_x, tile_shape.width, sides)
-                embed_box = Box(embed_y, output_tile_shape.height, embed_x, output_tile_shape.width, sides)
+                if sides.bottom:
+                    tile = Box(self._input_size.height - tile_shape.height, tile.height, tile.x, tile.width, tile.sides)
+                    map_y = output_shape.height - map_tile_shape.height
+                if sides.right:
+                    tile = Box(tile.y, tile.height, self._input_size.width - tile_shape.width, tile.width, tile.sides)
+                    map_x = output_shape.width - map_tile_shape.width
+
+                tile_box = Box(tile.y, tile_shape.height, tile.x, tile_shape.width, sides)
+                embed_box = Box(map_y, map_tile_shape.height, map_x, map_tile_shape.width, sides)
 
                 tile_boxes.append(tile_box)
                 embed_boxes.append(embed_box)
@@ -358,8 +442,9 @@ class StreamingSGD(object):
 
             # Do the actual forward pass
             #
-            output = self.model.forward(data, self._stream_to_layer, detach=False)
-            tile_output, trimmed = self._tree[self._stream_to_layer].trim_to_valid_output(output, tile)
+            self._layer_should_detach = False
+            output = self.model.forward(data, self._stream_to_layer)
+            tile_output, _ = self._tree[self._stream_to_layer].trim_to_valid_output(output, tile)
             output_size = self._tree[self._stream_to_layer].output_shape
 
             # Create (to be reconstructed) feature_map placeholder variable if it doesn't exists yet
@@ -390,241 +475,100 @@ class StreamingSGD(object):
 
         # Run reconstructed feature map through the end of the network
         #
-        final_output = self.model.forward(feature_map, start_index=self._stream_to_layer)
+        final_output = self.model.forward(feature_map, start_at_layer=self._stream_to_layer)
 
         return final_output, feature_map
 
-    def fill_tensor(self, data, data_location, already_filled):
+    @staticmethod
+    def fill_tensor(data, data_loc: Box, tensor_shape: IOShape, already_filled: Box):
         # make relevant_gradient method more generalizable (could also be used for output in forward pass!
-        return
-
-    def _relevant_gradients(self, gradients, targed_map_coords, grad_crop_box, outputs, filled_grad_coords, fill_gradients=False, full_gradients=None):
-        """
-        Gradients should be in order of network layers
-        We assume patches are backpropped from left to right, top to bottom
-
-        In this function we keep track of which parts of the gradients of inputs to each layer we
-        already reconstructed. It will only remember the 'relevant' part of the gradient per patch.
-        We need this functions because there can be significant overlap in the gradients in some layers.
-        """
-
-        # filled_grad_coords is the array that keeps track of which gradients are filled
+        # Check if this is a new row
         #
-        if filled_grad_coords is None:
-            filled_grad_coords = torch.FloatTensor(len(gradients), 3).fill_(0)  # y, x, height
+        rel_top = 0  # 0
+        rel_bottom = 0  # 1
+        rel_left = 0  # 2
+        rel_right = 0  # 3
 
-        # If we want to remember the reconstructed input gradient create the placeholder list
+        already_filled_y = already_filled.y
+        already_filled_x = already_filled.x
+        already_filled_height = already_filled.height
+
+        # check if new row
+        if data_loc.x == 0:
+            if data_loc.y + tensor_shape.height > already_filled_height:
+                already_filled_y = already_filled_height
+                already_filled_height = data_loc[0] + data.shape[2]
+                already_filled_x = 0
+
+        # Check x (column):
         #
-        if fill_gradients is True:
-            if full_gradients is None:
-                full_gradients = []
-
-        # List with the final reconstructed input gradients (for this patch)
+        # If this gradient is exactly on the border we can use everything in x-axis
         #
-        rel_gradients = []
+        if data_loc.x == already_filled_x:
+            rel_left = 0
+            rel_right = data.shape[3]
 
-        # To calculate where we currently are in the input gradient, we need to keep track of the downsampling
+        # If this gradient has some overlap with our current location check if we should use it
         #
-        prev_down = self._patch_output_lost[1][-1]
+        elif data_loc.x + tensor_shape.width > already_filled_x:
+            if already_filled_x - data_loc.x < 0:
+                print("Misses gradient in x-direction! Will probably crash...")
+                print("We should be at:", already_filled_x, "but are at:", data_loc.x)
+                print("Gradient size:", tensor_shape.width)
+            rel_left = already_filled_x - data_loc.x
+            rel_right = data.shape[3]
 
-        # Current coordinate of the input gradient of the reconstructed feature map
+        # Check y (row):
         #
-        c_coord = torch.FloatTensor(targed_map_coords[0:2])
+        # If this gradient is exactly on the border we can use everything in y-axis
+        #
+        if data_loc.y == already_filled_y:
+            rel_top = 0
+            rel_bottom = data.shape[2]
 
-        new_row = False
-        for i, gradient in enumerate(gradients):
-            # Current gradient locations
+        # If this gradient has some overlap with our current location check if we should use it
+        #
+        elif data_loc.y + data.shape[2]:
+            if already_filled_y - data_loc[0] < 0:
+                print("We miss pieces of gradient in y-direction! Continuing...")
+                print("We should be at:", already_filled_y, "but are at:", data_loc.y)
+                return None
+            rel_top = already_filled_y - data_loc.y
+            rel_bottom = data.shape[2]
+
+            # Check the bottom y-coord (if on the bottom we need to adjust)
             #
-            c_gradient_coords = filled_grad_coords[i]
-            c_gradient_size = self._gradient_sizes[-(i + 1)]
+            if already_filled_y + (data.shape[2] - rel_top) > tensor_shape.height:
+                rel_top += (already_filled_y + (data.shape[2] - rel_top)) \
+                    - tensor_shape.height
 
-            if i == 0:
-                # We do not lose gradients in the first layer, since they come from the reconstructed feature map.
-                c_gradient_lost = torch.FloatTensor([0, 0, 0, 0])
-                c_padding = torch.FloatTensor([0, 0, 0, 0])
-            else:
-                # left right top bottom
-                c_gradient_lost = self._patch_output_lost[0][-(i)] * 2
-                c_padding = self._patch_output_lost[3][-(i)]
+        # Set new gradient location
+        #
+        already_filled_x += (rel_right - rel_left)
 
-            # Calculate how much of the input is lost in the conv operation of this layer
-            #
-            c_gradient_down = prev_down / self._patch_output_lost[1][-(i + 1)]
-            c_gradient_lost[0:2] /= self._patch_output_lost[1][-(i + 1)]
-            c_gradient_lost[2:] /= self._patch_output_lost[1][-(i + 1)]
+        # Check the right x-coord (if on the right edge we need to adjust)
+        #
+        if already_filled_x > tensor_shape.width:
+            rel_left += (already_filled_x - tensor_shape.width)
+            already_filled_x -= (already_filled_x - tensor_shape.width)
 
-            prev_down = self._patch_output_lost[1][-(i + 1)]
+        rel_top = int(rel_top)
+        rel_left = int(rel_left)
+        rel_bottom = int(rel_bottom)
+        rel_right = int(rel_right)
 
-            # Calculate current coords
-            #
-            c_coord *= c_gradient_down
-            # if c_gradient_coords[1] > 0 and i == 0:
-            #    set_trace()
+        if rel_top < 0:
+            print("We miss gradients in y-axis before:", data_loc)
+        if rel_left < 0:
+            print("We miss gradients in x-axis before:", data_loc)
 
-            # If we already were at the border, the new gradient location is also there
-            #
-            if c_coord[0] <= 0:
-                c_coord[0] = 0
-            else:
-                # otherwise we need to offset for input lost
-                #
-                c_coord[0] += c_gradient_lost[2] + c_padding[1]
+        return Box(rel_top, rel_bottom - rel_top, rel_left, rel_right - rel_left, None), \
+            Box(already_filled_y, already_filled_height, already_filled_x, 0, None)
 
-            # Same holds for x-axes
-            if c_coord[1] <= 0:
-                c_coord[1] = 0
-            else:
-                c_coord[1] += c_gradient_lost[0] + c_padding[0]
-
-            # if i == 0:
-            # set_trace()
-            # print(i, c_coord.tolist(), c_padding.tolist(), c_gradient_coords.tolist())
-
-            # if i == 1:
-            # print(c_padding.tolist(), c_coord.tolist(), c_gradient_size)
-
-            # Calculate relevant gradient coords
-            #
-            rel_coords = [0, 0, 0, 0]  # y, h+y, x, w+x
-
-            # Check if this is a new row
-            #
-            if c_coord[1] == 0:
-                if i == 0:
-                    new_row = True
-                # Don't reset X - row if not needed
-                #
-                if new_row:
-                    if c_coord[0] + gradient.shape[2] > c_gradient_coords[2]:
-                        c_gradient_coords[0] = c_gradient_coords[2]
-                        c_gradient_coords[2] = c_coord[0] + gradient.shape[2]
-                        c_gradient_coords[1] = 0
-
-            #####################
-            # Check x (column): #
-            #####################
-            #
-            # If this gradient is exactly on the border we can use everything in x-axis
-            #
-            if c_coord[1] == c_gradient_coords[1]:
-                rel_coords[2] = 0
-                rel_coords[3] = gradient.shape[3]
-
-            # If this gradient has some overlap with our current location check if we should use it
-            #
-            elif c_coord[1] + gradient.shape[3] > c_gradient_coords[1]:
-                if c_gradient_coords[1] - c_coord[1] < 0:
-                    print("gradient i:", i, "misses gradient in x-direction! Will probably crash...")
-                    print("We should be at:", c_gradient_coords[1], "but are at:", c_coord[1])
-                    print("Gradient size:", gradient.shape)
-                    continue
-                rel_coords[2] = c_gradient_coords[1] - c_coord[1]
-                rel_coords[3] = gradient.shape[3]
-
-            ##################
-            # Check y (row): #
-            ##################
-            #
-            # If this gradient is exactly on the border we can use everything in y-axis
-            #
-            if c_coord[0] == c_gradient_coords[0]:
-                rel_coords[0] = 0
-                rel_coords[1] = gradient.shape[2]
-
-            # If this gradient has some overlap with our current location check if we should use it
-            #
-            elif c_coord[0] + gradient.shape[2]:
-                if c_gradient_coords[0] - c_coord[0] < 0:
-                    print("We miss pieces of gradient in y-direction! Continuing...")
-                    print("We should be at:", c_gradient_coords[0], "but are at:", c_coord[0])
-                    continue
-                rel_coords[0] = c_gradient_coords[0] - c_coord[0]
-                rel_coords[1] = gradient.shape[2]
-
-                # Check the bottom y-coord (if on the bottom we need to adjust)
-                #
-                if c_gradient_coords[0] + (gradient.shape[2] - rel_coords[0]) > c_gradient_size[1]:
-                    rel_coords[0] += (c_gradient_coords[0] + (gradient.shape[2] - rel_coords[0])) \
-                        - c_gradient_size[1]
-
-            # Set new gradient location
-            #
-            c_gradient_coords[1] += (rel_coords[3] - rel_coords[2])
-
-            # Check the right x-coord (if on the right edge we need to adjust)
-            #
-            if c_gradient_coords[1] > c_gradient_size[0]:
-                rel_coords[2] += (c_gradient_coords[1] - c_gradient_size[0])
-                c_gradient_coords[1] -= (c_gradient_coords[1] - c_gradient_size[0])
-
-            rel_coords = [int(coord) for coord in rel_coords]
-
-            if rel_coords[0] < 0:
-                print("We miss gradients in y-axis before:", c_coord)
-            if rel_coords[2] < 0:
-                print("We miss gradients in x-axis before:", c_coord)
-
-            # Clone the right gradients and save the corresponding output
-            #
-            if rel_coords[1] - rel_coords[0] == 0:
-                continue
-            if rel_coords[3] - rel_coords[2] == 0:
-                continue
-
-            rel_gradient = gradient[:, :, rel_coords[0]:rel_coords[1], rel_coords[2]:rel_coords[3]]
-            rel_output = outputs[-(i + 1)][:, :, rel_coords[0]:rel_coords[1], rel_coords[2]:rel_coords[3]]
-
-            ###################
-            if c_coord[0] > 0:
-                c_coord[0] -= c_padding[1]
-
-            # Same holds for x-axes
-            if c_coord[1] > 0:
-                c_coord[1] -= c_padding[0]
-            ####################
-
-            # If we want to return the reconstructed input gradients to each layer, save them here
-            #
-            if fill_gradients:
-                if i == len(full_gradients):
-                    full_gradients.append(
-                        torch.autograd.Variable(
-                            torch.FloatTensor(1, rel_gradient.shape[1],
-                                              int(self._gradient_sizes[-(i + 1)][0]),
-                                              int(self._gradient_sizes[-(i + 1)][1]))))
-
-                    full_gradients[i].fill_(0)
-
-                # Check if in this part of the gradient we didn't already put values
-                #
-                #if np.count_nonzero(full_gradients[i - 1][:, :,
-                #                                          int(c_gradient_coords[0]):
-                #                                          int(c_gradient_coords[2]),
-                #                                          int(c_gradient_coords[1] - rel_gradient.shape[3]):
-                #                                          int(c_gradient_coords[1])]) > 0:
-                #    print("Overwriting!")
-
-                full_gradients[i][:, :,
-                                  int(c_gradient_coords[0]):
-                                  int(c_gradient_coords[2]),
-                                  int(c_gradient_coords[1] - rel_gradient.shape[3]):
-                                  int(c_gradient_coords[1])] = rel_gradient.clone()
-
-            rel_gradients.append((rel_gradient.clone(), rel_output))
-
-        if fill_gradients:
-            return rel_gradients, filled_grad_coords, full_gradients
-        else:
-            return rel_gradients, filled_grad_coords, None
-
-    def _backward_patches(self, image, feature_map, fill_gradients=False):
+    def _backward_tiles(self, image, feature_map, fill_gradients=False):
         """
         This function is responsible for doing the backward pass per tile
         """
-        relevant_grads = []
-        filled_grad_coords = None
-        full_gradients = None
-
         if self._batch:
             self._save_batch_gradients()
             self._zero_gradient()
@@ -634,14 +578,17 @@ class StreamingSGD(object):
         else:
             iterator = enumerate(self._back_tiles)
 
-        for i, tile in iterator:
-            self._save_gradients()
+        self._filled = {}
 
+        layerstats_last_layer = self._tree[self._stream_to_layer]
+        first_backward_layer = layerstats_last_layer.name
+        for i, tile in iterator:
             # Extract the tile
             #
+            # TODO: test if clone() here is needed
             data = image[:, :,
                          int(tile.y):int(tile.y + tile.height),
-                         int(tile.x):int(tile.x + tile.width)].clone()  # TODO: test if clone() here is needed
+                         int(tile.x):int(tile.x + tile.width)]
 
             if self._cuda:
                 data = data.cuda()
@@ -649,26 +596,24 @@ class StreamingSGD(object):
             # Get the relevant part of the feature map for this tile
             #
             map_c = self._grad_map_coords[i]
+            # TODO: test if clone() here is needed
             tile_map_grad = feature_map[:, :,
                                         int(map_c.y):int(map_c.y + map_c.height),
-                                        int(map_c.x):int(map_c.x + map_c.width)].clone()  # TODO: test if clone() here is needed
+                                        int(map_c.x):int(map_c.x + map_c.width)]
+
+            self._current_tile = tile
+            self._current_fmap_tile = map_c
 
             # Do partial forward pass and backward pass
             # Hooks will be used to fetch relevant gradients / outputs
             #
-            self.model.forward(data, stop_index=self._stream_to_layer)
-            self.model.backward(gradient=tile_map_grad)
-
-            # self._restore_gradients() TODO: restore gradient should be layer based
-
-            # Redo backward pass with the relevant parts of the gradient
-            #
-            # self._apply_gradients() TODO: apply gradient should be layer based
+            self._layer_should_detach = True
+            self.model.forward(data, stop_at_layer=self._stream_to_layer)
+            self._backward_sequential(first_backward_layer, tile_map_grad)
 
             # Needed for memory control
             #
-            del self._gradients
-            del self._outputs
+            # del self._outputs
             del data
             del tile_map_grad
 
@@ -676,22 +621,12 @@ class StreamingSGD(object):
             self._sum_batch_gradients()
             self._batch_count += 1
 
-        trimmed_full_gradient = []
-        if full_gradients and self._verbose:
-            for i, gradients in enumerate(full_gradients):
-                for j, gradient in enumerate(gradients):
-                    filled_shape = filled_grad_coords[i]
-                    gradient = gradient[:, 0:int(filled_shape[2]), 0:int(filled_shape[1])]
-                    trimmed_full_gradient.append(gradient)
-                    print("Filled gradient size", gradient.shape)
+        self._layer_should_detach = False
 
         if self._verbose:
-            print("\nFilled gradient sizes:")
-            print(filled_grad_coords, "\n")
+            print("Everything filled:\n", self._check_gradient_size(self._filled))
 
-            print("Everything filled:\n", self._check_gradient_size(filled_grad_coords, self._gradient_sizes))
-
-        return relevant_grads, trimmed_full_gradient
+        return None  # trimmed_full_gradient
 
     # --------------------------
     # Gradient utility functions
@@ -704,14 +639,13 @@ class StreamingSGD(object):
                     layer.weight.grad.data.zero_()
                     layer.bias.grad.data.zero_()
 
-    def _save_gradients(self):
+    def _save_gradients(self, from_layer_name):
         """Save all the gradients of all the streaming Conv2d layers"""
-        self._saved_gradients = {}
-        for key, layer in self._tree.items():
-            if isinstance(layer, torch.nn.Conv2d):
-                if layer.weight.grad is not None:
-                    self._saved_gradients[key] = (layer.weight.grad.data.clone(),
-                                                  layer.bias.grad.data.clone())
+        for key, layerstat in self._tree.items():
+            if isinstance(layerstat.layer, torch.nn.Conv2d):
+                if layerstat.layer.weight.grad is not None:
+                    self._saved_gradients[key] = (layerstat.layer.weight.grad.data.clone(),
+                                                  layerstat.layer.bias.grad.data.clone())
 
     def _save_batch_gradients(self):
         """Save the valid batch gradients"""
@@ -722,21 +656,22 @@ class StreamingSGD(object):
                     self._saved_batch_gradients[key] = (layer.weight.grad.data.clone(),
                                                         layer.bias.grad.data.clone())
 
-    def _restore_gradients(self, name):
+    def _restore_gradients(self, from_layer_name):
         """Restore the saved valid Conv2d gradients"""
-        layer = self._tree[name].layer
-        if layer.weight.grad is not None:
-            layer.weight.grad.data.fill_(0)
-            layer.bias.grad.data.fill_(0)
+        for key, layerstat in self._tree.items():
+            if isinstance(layerstat.layer, torch.nn.Conv2d):
+                if layerstat.layer.weight.grad is not None:
+                    layerstat.layer.weight.grad.data.fill_(0)
+                    layerstat.layer.bias.grad.data.fill_(0)
 
-            if len(self._saved_gradients) > 0:
-                gradient_tuple = self._saved_gradients[name]
-                layer.weight.grad.data += gradient_tuple[0]
-                layer.bias.grad.data += gradient_tuple[1]
+                    if key in self._saved_gradients:
+                        gradient_tuple = self._saved_gradients[key]
+                        layerstat.layer.weight.grad.data += gradient_tuple[0]
+                        layerstat.layer.bias.grad.data += gradient_tuple[1]
 
     def _sum_batch_gradients(self):
         """Sum gradients within a batch"""
-        if len(self._saved_batch_gradients) == 0:
+        if not self._saved_batch_gradients:
             return
 
         for key, layer in self._tree.items():
@@ -766,12 +701,14 @@ class StreamingSGD(object):
                     layer.weight.grad.data /= self._batch_count
                     layer.bias.grad.data /= self._batch_count
 
-    def _check_gradient_size(self, filled_grad_coords, gradient_sizes):
+    def _check_gradient_size(self, filled_grad_coords):
         correct = True
-        for i, size in enumerate(gradient_sizes):
-            filled_size = filled_grad_coords[-(i + 1)]
-            if size[0] > filled_size[2] and size[1] > filled_size[1]:
+        for name, box in filled_grad_coords.items():
+            size = self._tree[name].output_shape
+            if size.height != box.height or size.width != box.x:
                 correct = False
+                print(name, "original gradient shape:", (size.width, size.height),
+                      "reconstructed gradient shape: ", (box.x, box.height))
                 break
         if not correct:
             print("!!!! Some gradient are smaller than they should be",
@@ -783,39 +720,97 @@ class StreamingSGD(object):
     # --------------------------
     # Model layer utility functions
     #
-    def _add_hooks_sequential(self):
-        for name, layerstats in self._get_layers():
-            if name == self._stream_to_layer:
+    def _backward_sequential(self, layer, gradient):
+        output_layer = self._tree[self._stream_to_layer]
+        while gradient is not None:
+            layerstats = self._tree[layer]
+            output = self._layer_outputs[layer]
+
+            self._save_gradients(layer)
+
+            output.backward(gradient=gradient, retain_graph=True)
+
+            # we carried the gradient to the input of current layer
+            next_gradient = self._layer_inputs[layer].grad.clone()
+
+            # apply right part of the gradient
+            valid_grad, valid_lost = layerstats.trim_to_valid_gradient(gradient.clone(),
+                                                                       self._stream_to_layer,
+                                                                       self._current_tile)
+
+            valid_output = output[:, :,
+                                  int(valid_lost.top):int(output.shape[2] - valid_lost.bottom),
+                                  int(valid_lost.left):int(output.shape[3] - valid_lost.right)]
+
+            # calculate location of output in current layers input
+            data_loc = layerstats.calculate_input_coords_for_output(
+                y=self._current_fmap_tile.y,
+                x=self._current_fmap_tile.x,
+                output_layer=output_layer)
+
+            if layer not in self._filled:
+                self._filled[layer] = Box(0, 0, 0, 0, None)
+
+            data_loc = Box(y=data_loc.y + valid_lost.top, height=0, x=data_loc.x + valid_lost.left, width=0, sides=None)
+
+            relevant_box, grad_filled = self.fill_tensor(data=valid_grad,
+                                                         data_loc=data_loc,
+                                                         tensor_shape=self._tree[layer].output_shape,
+                                                         already_filled=self._filled[layer])
+
+            self._filled[layer] = grad_filled
+
+            self._restore_gradients(layer)
+
+            if relevant_box.height > 0 and relevant_box.width > 0:
+                relevant_grad = valid_grad[:, :, relevant_box.y:relevant_box.y + relevant_box.height,
+                                           relevant_box.x:relevant_box.x + relevant_box.width]
+                relevant_output = valid_output[:, :, relevant_box.y:relevant_box.y + relevant_box.height,
+                                               relevant_box.x:relevant_box.x + relevant_box.width]
+
+                relevant_output.backward(gradient=relevant_grad)
+
+            gradient = next_gradient
+
+            if layerstats.previous is None:
                 break
-            layerstats.layer.register_forward_pre_hook(lambda module, input: self._forward_pre_hook(module, input, name))
-            layerstats.layer.register_forward_hook(lambda module, input, output: self._forward_hook(module, input, output, name))
-            layerstats.layer.register_backward_hook(lambda module, grad_input, grad_output: self._backward_hook(module, grad_input, grad_output, name))
-        return
 
-    def _forward_pre_hook(self, module, input):
+            layer = layerstats.previous.name
+
+    def _add_hooks_sequential(self):
+        for name, layer in self._get_layers():
+            layer.register_forward_pre_hook(self._forward_pre_hook)
+
+            if name == self._stream_to_layer:
+                layer.register_forward_hook(self._forward_hook)
+                break
+
+    def _forward_pre_hook(self, module, layer_input):
         # detach input inplace
-        input.detach_()
+        if self._layer_should_detach:
+            name = self._reverse_tree[module]
+            layerstats = self._tree[name]
+            if layerstats.previous:
+                self._layer_outputs[layerstats.previous.name] = layer_input[0].clone()
+            layer_input[0].detach_()
+            layer_input[0].requires_grad = True
+            self._layer_inputs[name] = layer_input[0]
 
-    def _forward_hook(self, module, input, output):
+    def _forward_hook(self, module, layer_input, layer_output):
         # we need to save the output
-        name = self._reverse_tree[module]
-        self._outputs[name] = self._tree[name].trim_to_valid_output(output, self._current_tile)
-
-    def _backward_hook(self, module, grad_input, grad_output):
-        name = self._reverse_tree[module]
-        valid_grad = self._tree[name].trim_to_valid_gradient(grad_output.clone(), self._current_tile)
-        self._restore_gradients(name)
-        self._apply_gradient(name, valid_grad)
+        if self._layer_should_detach:
+            name = self._reverse_tree[module]
+            self._layer_outputs[name] = layer_output
 
     def _get_layers(self, modules=None):
         if modules is None:
             modules = self.model.named_children()
 
         layers = []
-        for m in modules:
-            layers.append(m)
+        for mod in modules:
+            layers.append(mod)
             try:
-                mod_layers = self._get_layers(m[1].named_children())
+                mod_layers = self._get_layers(mod[1].named_children())
                 layers.extend(mod_layers)
             except StopIteration:
                 pass
@@ -827,10 +822,12 @@ class StreamingSGD(object):
 
         # loop through layers and do layer_stats, save in dict
         stats = {}
+        reverse_stats = {}
         current_shape = input_shape
         prev_name = None
         for name, layer in layer_dict.items():
-            stats[name] = LayerStats.stats_with_layer(layer, current_shape)
+            stats[name] = LayerStats.stats_with_layer(layer, current_shape, name)
+            reverse_stats[layer] = name
             current_shape = stats[name].output_shape
             if prev_name is not None:
                 stats[name].previous = stats[prev_name]
@@ -840,4 +837,4 @@ class StreamingSGD(object):
 
             prev_name = name
 
-        return stats
+        return stats, reverse_stats
