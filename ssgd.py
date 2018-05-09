@@ -33,7 +33,7 @@ class LayerStats(object):
     """This class is responsible for calculating layer specific statistics,
     such as padding, output lost, gradient invalidated by convolution / zero-padding
     """
-    def __init__(self, layer, padding, output_lost, downsamples, gradient_lost, output_shape, name):
+    def __init__(self, layer, padding, output_lost, downsamples, gradient_lost, output_shape, name, streaming=False):
         self.next = None
         self.previous = None
         self.padding = padding
@@ -43,6 +43,7 @@ class LayerStats(object):
         self.downsamples = downsamples
         self.layer = layer
         self.name = name
+        self.streaming = streaming
 
     @classmethod
     def stats_with_layer(cls, layer, input_shape, name):
@@ -470,8 +471,7 @@ class StreamingSGD(object):
 
         # From the feature map on we have to be able to generate gradients again
         #
-        feature_map.volatile = False
-        feature_map.requires_grad = True
+        feature_map = torch.autograd.Variable(feature_map.data, requires_grad=True)
 
         # Run reconstructed feature map through the end of the network
         #
@@ -639,10 +639,10 @@ class StreamingSGD(object):
                     layer.weight.grad.data.zero_()
                     layer.bias.grad.data.zero_()
 
-    def _save_gradients(self, from_layer_name):
+    def _save_gradients(self):
         """Save all the gradients of all the streaming Conv2d layers"""
         for key, layerstat in self._tree.items():
-            if isinstance(layerstat.layer, torch.nn.Conv2d):
+            if isinstance(layerstat.layer, torch.nn.Conv2d) and layerstat.streaming:
                 if layerstat.layer.weight.grad is not None:
                     self._saved_gradients[key] = (layerstat.layer.weight.grad.data.clone(),
                                                   layerstat.layer.bias.grad.data.clone())
@@ -656,10 +656,10 @@ class StreamingSGD(object):
                     self._saved_batch_gradients[key] = (layer.weight.grad.data.clone(),
                                                         layer.bias.grad.data.clone())
 
-    def _restore_gradients(self, from_layer_name):
+    def _restore_gradients(self):
         """Restore the saved valid Conv2d gradients"""
         for key, layerstat in self._tree.items():
-            if isinstance(layerstat.layer, torch.nn.Conv2d):
+            if isinstance(layerstat.layer, torch.nn.Conv2d) and layerstat.streaming:
                 if layerstat.layer.weight.grad is not None:
                     layerstat.layer.weight.grad.data.fill_(0)
                     layerstat.layer.bias.grad.data.fill_(0)
@@ -726,7 +726,7 @@ class StreamingSGD(object):
             layerstats = self._tree[layer]
             output = self._layer_outputs[layer]
 
-            self._save_gradients(layer)
+            self._save_gradients()
 
             output.backward(gradient=gradient, retain_graph=True)
 
@@ -760,7 +760,7 @@ class StreamingSGD(object):
 
             self._filled[layer] = grad_filled
 
-            self._restore_gradients(layer)
+            self._restore_gradients()
 
             if relevant_box.height > 0 and relevant_box.width > 0:
                 relevant_grad = valid_grad[:, :, relevant_box.y:relevant_box.y + relevant_box.height,
@@ -825,8 +825,12 @@ class StreamingSGD(object):
         reverse_stats = {}
         current_shape = input_shape
         prev_name = None
+        streaming = True
         for name, layer in layer_dict.items():
             stats[name] = LayerStats.stats_with_layer(layer, current_shape, name)
+            stats[name].streaming = streaming
+            if name == self._stream_to_layer:
+                streaming = False
             reverse_stats[layer] = name
             current_shape = stats[name].output_shape
             if prev_name is not None:
