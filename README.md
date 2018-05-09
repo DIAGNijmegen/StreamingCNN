@@ -1,3 +1,5 @@
+### Develop branch, refactored and easier to understand code. The implementation here is almost ready. 
+
 # StreamingSGD
 This repository is an example implementation of Streaming SGD as published here: https://openreview.net/forum?id=HJ7lIcjoM
 
