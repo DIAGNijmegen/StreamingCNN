@@ -122,7 +122,6 @@ class LayerStats(object):
             return shape
 
     def calculate_output_shape(self, in_shape, output_layer):
-        # TODO: this can be wrong if output_lost would be different for this in_shape
         next_layer = self
         while next_layer is not None:
             in_shape = self.stats_with_layer(next_layer.layer, in_shape, next_layer.name).output_shape
