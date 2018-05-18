@@ -141,7 +141,7 @@ class LayerStats(object):
     @property
     def total_downsampling(self) -> Lost:
         # should probably cache this
-        return self.downsampling_until()
+        return self.downsampling_upto()
 
     def downsampling_upto(self, until_layer=None):
         if self.name == until_layer or self.previous is None:
