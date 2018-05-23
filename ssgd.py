@@ -732,6 +732,8 @@ class StreamingSGD(object):
             output.backward(gradient=gradient, retain_graph=True)
 
             # we carried the gradient to the input of current layer
+            # check if the previous layer has a gradient at all 
+            # (eg input-layer will have None)
             if self._layer_inputs[layer].grad is not None:
                 next_gradient = self._layer_inputs[layer].grad.clone()
             else:
@@ -754,12 +756,19 @@ class StreamingSGD(object):
             if layer not in self._filled:
                 self._filled[layer] = Box(0, 0, 0, 0, None)
 
-            data_loc = Box(y=data_loc.y + valid_lost.top, height=0, x=data_loc.x + valid_lost.left, width=0, sides=None)
+            # move the location according to how many pixels have been trimmed
+            # this will be the location of the valid gradient of this layer in relation
+            # to the actual gradient in a normal backpass
+            data_loc = Box(y=data_loc.y + valid_lost.top, height=0,
+                           x=data_loc.x + valid_lost.left, width=0, sides=None)
 
+            # calculate which part of the gradient is 'new'
             relevant_box, grad_filled = self.fill_tensor(data=valid_grad,
                                                          data_loc=data_loc,
                                                          tensor_shape=self._tree[layer].output_shape,
                                                          already_filled=self._filled[layer])
+
+            # fill gradients if we want to keep track of them
             if fill_gradients:
                 if layer not in self._gradients:
                     self._gradients[layer] = torch.empty(self._tree[layer].output_shape)
