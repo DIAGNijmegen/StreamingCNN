@@ -565,9 +565,9 @@ class StreamingSGD(object):
         """
         This function is responsible for doing the backward pass per tile
         """
-        if self._batch:
-            self._save_batch_gradients()
-            self._zero_gradient()
+        # if self._batch:
+        #     self._save_batch_gradients()
+        #     self._zero_gradient()
 
         if self._verbose:
             iterator = tqdm(enumerate(self._back_tiles), total=len(self._back_tiles))
@@ -614,7 +614,7 @@ class StreamingSGD(object):
             del tile_map_grad
 
         if self._batch:
-            self._sum_batch_gradients()
+            # self._sum_batch_gradients()
             self._batch_count += 1
 
         self._layer_should_detach = False
@@ -630,13 +630,13 @@ class StreamingSGD(object):
     # --------------------------
     # Gradient utility functions
     #
-    def _zero_gradient(self):
-        """Zeros all the gradients of all the streaming Conv2d layers"""
-        for key, layer in self._tree.items():
-            if isinstance(layer, torch.nn.Conv2d):
-                if layer.weight.grad is not None:
-                    layer.weight.grad.data.zero_()
-                    layer.bias.grad.data.zero_()
+    # def _zero_gradient(self):
+    #     """Zeros all the gradients of all the streaming Conv2d layers"""
+    #     for key, layerstat in self._tree.items():
+    #         if isinstance(layerstat.layer, torch.nn.Conv2d):
+    #             if layerstat.layer.weight.grad is not None:
+    #                 layerstat.layer.weight.grad.data.zero_()
+    #                 layerstat.layer.bias.grad.data.zero_()
 
     def _save_gradients(self):
         """Save all the gradients of all the streaming Conv2d layers"""
@@ -646,14 +646,15 @@ class StreamingSGD(object):
                     self._saved_gradients[key] = (layerstat.layer.weight.grad.data.clone(),
                                                   layerstat.layer.bias.grad.data.clone())
 
-    def _save_batch_gradients(self):
-        """Save the valid batch gradients"""
-        self._saved_batch_gradients = []
-        for key, layer in self._tree.items():
-            if isinstance(layer, torch.nn.Conv2d):
-                if layer.weight.grad is not None:
-                    self._saved_batch_gradients[key] = (layer.weight.grad.data.clone(),
-                                                        layer.bias.grad.data.clone())
+    # def _save_batch_gradients(self):
+    #     """Save the valid batch gradients"""
+    #     self._saved_batch_gradients = {}
+    #     for key, layerstat in self._tree.items():
+    #         if isinstance(layerstat.layer, torch.nn.Conv2d):
+    #             if layerstat.layer.weight.grad is not None:
+    #                 print(key)
+    #                 self._saved_batch_gradients[key] = (layerstat.layer.weight.grad.data.clone(),
+    #                                                     layerstat.layer.bias.grad.data.clone())
 
     def _restore_gradients(self):
         """Restore the saved valid Conv2d gradients"""
@@ -668,17 +669,18 @@ class StreamingSGD(object):
                         layerstat.layer.weight.grad.data += gradient_tuple[0]
                         layerstat.layer.bias.grad.data += gradient_tuple[1]
 
-    def _sum_batch_gradients(self):
-        """Sum gradients within a batch"""
-        if not self._saved_batch_gradients:
-            return
+    # def _sum_batch_gradients(self):
+    #     """Sum gradients within a batch"""
+    #     if not self._saved_batch_gradients:
+    #         return
 
-        for key, layer in self._tree.items():
-            if isinstance(layer, torch.nn.Conv2d):
-                if layer.weight.grad is not None:
-                    gradient_tuple = self._saved_batch_gradients[key]
-                    layer.weight.grad.data += gradient_tuple[0]
-                    layer.bias.grad.data += gradient_tuple[1]
+    #     for key, layerstat in self._tree.items():
+    #         if isinstance(layerstat.layer, torch.nn.Conv2d):
+    #             if layerstat.layer.weight.grad is not None:
+    #                 if key in self._saved_batch_gradients:
+    #                     gradient_tuple = self._saved_batch_gradients[key]
+    #                     layerstat.layer.weight.grad.data += gradient_tuple[0]
+    #                     layerstat.layer.bias.grad.data += gradient_tuple[1]
 
     def _apply_gradients(self, name, valid_grad):
         """Apply the relevant gradients"""
@@ -689,16 +691,16 @@ class StreamingSGD(object):
         for every images backpropped after this function call."""
         self._batch = True
         self._batch_count = 0
-        self._zero_gradient()
+        # self._zero_gradient()
 
     def end_batch(self):
         """Stop current batch and divide all conv2d gradients with number of images in batch"""
         self._batch = False
-        for key, layer in self._tree.items():
-            if isinstance(layer, torch.nn.Conv2d):
-                if layer.weight.grad is not None:
-                    layer.weight.grad.data /= self._batch_count
-                    layer.bias.grad.data /= self._batch_count
+        for key, layerstat in self._tree.items():
+            if isinstance(layerstat.layer, torch.nn.Conv2d):
+                if layerstat.layer.weight.grad is not None:
+                    layerstat.layer.weight.grad.data /= self._batch_count
+                    layerstat.layer.bias.grad.data /= self._batch_count
 
     def _check_gradient_size(self, filled_grad_coords):
         correct = True
