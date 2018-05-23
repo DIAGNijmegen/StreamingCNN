@@ -792,6 +792,10 @@ class StreamingSGD(object):
 
             gradient = next_gradient
 
+            # remove activations we do not need anymore
+            del self._layer_outputs[layer]
+            del self._layer_inputs[layer]
+
             if layerstats.previous is None:
                 break
 
