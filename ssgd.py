@@ -201,15 +201,11 @@ class LayerStats(object):
 
         if tile.sides.left:
             l_left = 0
-            # l_right += lost.left
         if tile.sides.top:
             l_top = 0
-            # l_bottom += lost.top
         if tile.sides.right:
-            # l_left = lost.left
             l_right = 0
         if tile.sides.bottom:
-            # l_top = lost.top
             l_bottom = 0
 
         tensor = tensor[:, :,
@@ -277,25 +273,13 @@ class StreamingSGD(object):
 
         self._add_hooks_sequential()
 
-        # if self._verbose:
-        #     for key, value in self._tree.items():
-        #         print(value.output_shape, key)
-
         # Precalculate the coordinates of the tiles in the forward pass
         #
         self._forward_tiles, self._map_coords = self._calculate_tile_boxes()
 
-        # if self._verbose:
-        #     for ftiles, mtiles in zip(self._forward_tiles, self._map_coords):
-        #         print(ftiles, mtiles)
-
         # Precalculate the coordinates of the tiles in the backward pass
         #
         self._back_tiles, self._grad_map_coords = self._calculate_tile_boxes(backwards=True)
-
-        # if self._verbose:
-        #     for btiles, mtiles in zip(self._back_tiles, self._grad_map_coords):
-        #         print(btiles, mtiles)
 
         if self._verbose:
             print("Tile size forward:", (self._forward_tiles[0].height, self._forward_tiles[0].width))
