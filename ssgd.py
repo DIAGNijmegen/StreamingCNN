@@ -48,12 +48,12 @@ class LayerStats(object):
     @classmethod
     def stats_with_layer(cls, layer, input_shape, name):
         output_channels = input_shape[1]
-        cur_stride = torch.FloatTensor(layer.stride)
+        cur_stride = layer.stride
         kernel_size = layer.kernel_size
         c_padding = layer.padding
 
         if isinstance(layer, torch.nn.MaxPool2d):
-            cur_stride = torch.FloatTensor([layer.stride, layer.stride])
+            cur_stride = [layer.stride, layer.stride]
             kernel_size = (kernel_size, kernel_size)
         else:
             output_channels = layer.out_channels
@@ -80,8 +80,8 @@ class LayerStats(object):
         padding_this_layer = Lost(top=c_padding[1], left=c_padding[0], bottom=c_padding[1], right=c_padding[0])
 
         next_shape = [1, output_channels,
-                      input_shape[2] - p_top - p_bottom + c_padding[0] * 2,
-                      input_shape[3] - p_left - p_right + c_padding[1] * 2]
+                      float(input_shape[2] - p_top - p_bottom + c_padding[0] * 2),
+                      float(input_shape[3] - p_left - p_right + c_padding[1] * 2)]
 
         next_shape[2] //= cur_stride[0]
         next_shape[3] //= cur_stride[1]
@@ -94,7 +94,7 @@ class LayerStats(object):
             output_lost=lost_this_layer,
             padding=padding_this_layer,
             gradient_lost=grad_lost_this_layer,
-            downsamples=downsamples,
+            downsamples=torch.tensor(downsamples, dtype=torch.float),
             name=name
         )
 
@@ -273,6 +273,7 @@ class StreamingSGD(object):
         self._filled = {}
         self._layer_should_detach = False
         self._saved_gradients = {}
+        self._gradients = {}
 
         self._add_hooks_sequential()
 
@@ -340,7 +341,8 @@ class StreamingSGD(object):
         if self._verbose:
             print("Doing backward pass...")
 
-        grad_embedding = torch.autograd.grad(loss, feature_map, only_inputs=False)[0]
+        loss.backward()
+        grad_embedding = feature_map.grad
 
         full_gradients = self._backward_tiles(image[None], grad_embedding, fill_gradients)
         return full_gradients
@@ -361,7 +363,8 @@ class StreamingSGD(object):
 
         tile_shape = last_layer_stats.calculate_input_shape(output_tile_shape, valid=True, gradient_lost=backwards)
         if backwards:
-            map_tile_shape = self._tree[self._first_layer].calculate_output_shape(tile_shape, output_layer=last_layer_stats)
+            map_tile_shape = self._tree[self._first_layer].calculate_output_shape(tile_shape,
+                                                                                  output_layer=last_layer_stats)
         else:
             map_tile_shape = output_tile_shape
 
@@ -407,6 +410,15 @@ class StreamingSGD(object):
                 tile_box = Box(tile.y, tile_shape.height, tile.x, tile_shape.width, sides)
                 embed_box = Box(map_y, map_tile_shape.height, map_x, map_tile_shape.width, sides)
 
+                # filter out duplicates
+                exists = False
+                for e_b in embed_boxes:
+                    if e_b.x == embed_box.x and e_b.y == embed_box.y:
+                        exists = True
+
+                if exists:
+                    continue
+
                 tile_boxes.append(tile_box)
                 embed_boxes.append(embed_box)
 
@@ -426,51 +438,53 @@ class StreamingSGD(object):
 
         # Reconstruct the feature map patch by patch
         #
-        for i, tile in iterator:
-            map_c = self._map_coords[i]
+        with torch.no_grad():
+            for i, tile in iterator:
+                map_c = self._map_coords[i]
 
-            # Fetch the relevant part of the full image
-            #
-            # TODO: try to remove ints in pytorch 0.4
-            data = image[:, :,
-                         int(tile.y):int(tile.y + tile.height),
-                         int(tile.x):int(tile.x + tile.width)].clone()  # not sure if we need clone here?
-            data.volatile = True
-
-            if self._cuda:
-                data = data.cuda()
-
-            # Do the actual forward pass
-            #
-            self._layer_should_detach = False
-            output = self.model.forward(data, self._stream_to_layer)
-            tile_output, _ = self._tree[self._stream_to_layer].trim_to_valid_output(output, tile)
-            output_size = self._tree[self._stream_to_layer].output_shape
-
-            # Create (to be reconstructed) feature_map placeholder variable if it doesn't exists yet
-            #
-            if feature_map is None:
-                feature_map = torch.autograd.Variable(torch.FloatTensor(1,
-                                                                        int(output_size.channels),
-                                                                        int(output_size.height),
-                                                                        int(output_size.width)))
-                if isinstance(data.data, torch.DoubleTensor):
-                    feature_map = feature_map.double()
+                # Fetch the relevant part of the full image
+                #
+                data = image[:, :,
+                             int(tile.y):int(tile.y + tile.height),
+                             int(tile.x):int(tile.x + tile.width)].clone()  # not sure if we need clone here?
 
                 if self._cuda:
-                    feature_map = feature_map.cuda()
+                    data = data.cuda()
 
-            # Save the output of the network in the relevant part of the feature_map
-            #
-            feature_map[:, :,
-                        int(map_c.y):int(map_c.y + map_c.height),
-                        int(map_c.x):int(map_c.x + map_c.width)] = tile_output
+                # Do the actual forward pass
+                #
+                self._layer_should_detach = False
+                output = self.model.forward(data, self._stream_to_layer)
+                # if i < 10:
+                #    print(output[:,0].data.numpy(), tile)
+                tile_output, _ = self._tree[self._stream_to_layer].trim_to_valid_output(output, tile)
+                output_size = self._tree[self._stream_to_layer].output_shape
 
-            tile_output = None  # trying memory management
+                # Create (to be reconstructed) feature_map placeholder variable if it doesn't exists yet
+                #
+                if feature_map is None:
+                    feature_map = torch.zeros(1,
+                                              int(output_size.channels),
+                                              int(output_size.height),
+                                              int(output_size.width), dtype=torch.float)
+
+                    if image.dtype == torch.double:
+                        feature_map = feature_map.double()
+
+                    if self._cuda:
+                        feature_map = feature_map.cuda()
+
+                # Save the output of the network in the relevant part of the feature_map
+                #
+                feature_map[:, :,
+                            int(map_c.y):int(map_c.y + map_c.height),
+                            int(map_c.x):int(map_c.x + map_c.width)] = tile_output
+
+                tile_output = None  # trying memory management
 
         # From the feature map on we have to be able to generate gradients again
         #
-        feature_map = torch.autograd.Variable(feature_map.data, requires_grad=True)
+        feature_map.requires_grad_()
 
         # Run reconstructed feature map through the end of the network
         #
@@ -480,7 +494,7 @@ class StreamingSGD(object):
 
     @staticmethod
     def fill_tensor(data, data_loc: Box, tensor_shape: IOShape, already_filled: Box):
-        # make relevant_gradient method more generalizable (could also be used for output in forward pass!
+        # This functions return which parts (could also be used for output in forward pass!)
         # Check if this is a new row
         #
         rel_top = 0  # 0
@@ -494,10 +508,9 @@ class StreamingSGD(object):
 
         # check if new row
         if data_loc.x == 0:
-            if data_loc.y + tensor_shape.height > already_filled_height:
-                already_filled_y = already_filled_height
-                already_filled_height = data_loc[0] + data.shape[2]
-                already_filled_x = 0
+            already_filled_y = already_filled_height
+            already_filled_height = data_loc[0] + data.shape[2]
+            already_filled_x = 0
 
         # Check x (column):
         #
@@ -584,7 +597,6 @@ class StreamingSGD(object):
         for i, tile in iterator:
             # Extract the tile
             #
-            # TODO: test if clone() here is needed
             data = image[:, :,
                          int(tile.y):int(tile.y + tile.height),
                          int(tile.x):int(tile.x + tile.width)]
@@ -595,7 +607,7 @@ class StreamingSGD(object):
             # Get the relevant part of the feature map for this tile
             #
             map_c = self._grad_map_coords[i]
-            # TODO: test if clone() here is needed
+
             tile_map_grad = feature_map[:, :,
                                         int(map_c.y):int(map_c.y + map_c.height),
                                         int(map_c.x):int(map_c.x + map_c.width)]
@@ -607,8 +619,9 @@ class StreamingSGD(object):
             # Hooks will be used to fetch relevant gradients / outputs
             #
             self._layer_should_detach = True
-            self.model.forward(data, stop_at_layer=self._stream_to_layer)
-            self._backward_sequential(first_backward_layer, tile_map_grad)
+            output = self.model.forward(data, stop_at_layer=self._stream_to_layer)
+            self._layer_outputs[self._stream_to_layer] = output
+            self._backward_sequential(first_backward_layer, tile_map_grad, fill_gradients)
 
             # Needed for memory control
             #
@@ -623,9 +636,12 @@ class StreamingSGD(object):
         self._layer_should_detach = False
 
         if self._verbose:
-            print("Everything filled:\n", self._check_gradient_size(self._filled))
+            print("Everything reconstructed:\n", self._check_gradient_size(self._filled))
 
-        return None  # trimmed_full_gradient
+        if fill_gradients:
+            return None  # trimmed_full_gradient
+        else:
+            return self._gradients
 
     # --------------------------
     # Gradient utility functions
@@ -719,7 +735,7 @@ class StreamingSGD(object):
     # --------------------------
     # Model layer utility functions
     #
-    def _backward_sequential(self, layer, gradient):
+    def _backward_sequential(self, layer, gradient, fill_gradients):
         output_layer = self._tree[self._stream_to_layer]
         while gradient is not None:
             layerstats = self._tree[layer]
@@ -730,13 +746,15 @@ class StreamingSGD(object):
             output.backward(gradient=gradient, retain_graph=True)
 
             # we carried the gradient to the input of current layer
-            next_gradient = self._layer_inputs[layer].grad.clone()
+            if self._layer_inputs[layer].grad is not None:
+                next_gradient = self._layer_inputs[layer].grad.clone()
+            else:
+                next_gradient = None
 
             # apply right part of the gradient
             valid_grad, valid_lost = layerstats.trim_to_valid_gradient(gradient.clone(),
                                                                        self._stream_to_layer,
                                                                        self._current_tile)
-
             valid_output = output[:, :,
                                   int(valid_lost.top):int(output.shape[2] - valid_lost.bottom),
                                   int(valid_lost.left):int(output.shape[3] - valid_lost.right)]
@@ -756,6 +774,9 @@ class StreamingSGD(object):
                                                          data_loc=data_loc,
                                                          tensor_shape=self._tree[layer].output_shape,
                                                          already_filled=self._filled[layer])
+            if fill_gradients:
+                if layer not in self._gradients:
+                    self._gradients[layer] = torch.empty(self._tree[layer].output_shape)
 
             self._filled[layer] = grad_filled
 
@@ -769,6 +790,11 @@ class StreamingSGD(object):
 
                 relevant_output.backward(gradient=relevant_grad)
 
+                if fill_gradients:
+                    self._gradients[layer][:, :,
+                                           int(grad_filled.y):int(grad_filled.height),
+                                           int(grad_filled.x - relevant_box.width):int(grad_filled.x)] = relevant_grad
+
             gradient = next_gradient
 
             if layerstats.previous is None:
@@ -781,7 +807,6 @@ class StreamingSGD(object):
             layer.register_forward_pre_hook(self._forward_pre_hook)
 
             if name == self._stream_to_layer:
-                layer.register_forward_hook(self._forward_hook)
                 break
 
     def _forward_pre_hook(self, module, layer_input):
@@ -791,15 +816,10 @@ class StreamingSGD(object):
             layerstats = self._tree[name]
             if layerstats.previous:
                 self._layer_outputs[layerstats.previous.name] = layer_input[0].clone()
-            layer_input[0].detach_()
-            layer_input[0].requires_grad = True
+            if layer_input[0]._grad_fn is not None:
+                layer_input[0].detach_()
+                layer_input[0].requires_grad = True
             self._layer_inputs[name] = layer_input[0]
-
-    def _forward_hook(self, module, layer_input, layer_output):
-        # we need to save the output
-        if self._layer_should_detach:
-            name = self._reverse_tree[module]
-            self._layer_outputs[name] = layer_output
 
     def _get_layers(self, modules=None):
         if modules is None:
