@@ -348,17 +348,15 @@ class StreamingSGD(object):
         """
         last_layer_stats = self._tree[self._stream_to_layer]
         output_shape = last_layer_stats.output_shape
+        downsampling = last_layer_stats.total_downsampling
         output_tile_shape = IOShape(batch=0, channels=0,
                                     height=output_shape.height // self._divide_in,
                                     width=output_shape.width // self._divide_in)
 
         tile_shape = last_layer_stats.calculate_valid_input_shape(output_tile_shape, gradient_lost=backwards)
-        if backwards:
-            map_tile_shape = self._tree[self._first_layer].calculate_output_shape(tile_shape,
-                                                                                  output_layer=last_layer_stats)
-        else:
-            map_tile_shape = self._tree[self._first_layer].calculate_output_shape(tile_shape,
-                                                                                  output_layer=last_layer_stats)
+
+        map_tile_shape = self._tree[self._first_layer].calculate_output_shape(tile_shape,
+                                                                              output_layer=last_layer_stats)
 
         # The size of the patch/tile is feature map / divide_in
         #
@@ -382,28 +380,47 @@ class StreamingSGD(object):
 
                 map_x = max(0, map_x)
                 map_y = max(0, map_y)
-
-                tile = self._tree[self._first_layer].calculate_input_coords_for_output(
+                tile_y, _, tile_x, _, _ = self._tree[self._first_layer].calculate_input_coords_for_output(
                     y=map_y, x=map_x, output_layer=last_layer_stats)
 
                 # Keep track if we are at the sides (because we shouldn't crop the output here)
                 #
                 sides = Sides(left=(x == 0), top=(y == 0),
-                              right=(tile.x + tile_shape.width >= self._input_size.width),
-                              bottom=(tile.y + tile_shape.height >= self._input_size.height))
+                              right=(tile_x + tile_shape.width >= self._input_size.width),
+                              bottom=(tile_y + tile_shape.height >= self._input_size.height))
 
                 # Move map coordinates based on position (sides) and padding
                 #
+                # ERROR: TODO: the problem is that the tile on the right edge not always fits on the
+                # downsampling grid. The best solution would be to recalculate output_lost for this tile
+                # this would mean output-lost has to be tile specific. It currently is layer specific.
                 map_height = map_tile_shape.height
                 map_width = map_tile_shape.width
+
+                tile_height = tile_shape.height
+                tile_width = tile_shape.width
+
                 if sides.bottom:
-                    tile = Box(self._input_size.height - tile_shape.height, tile.height, tile.x, tile.width, tile.sides)
                     map_y = output_shape.height - map_height
+                    tile_y = self._input_size.height - tile_shape.height
+
+                    if map_y % float(downsampling[0]) > 0:
+                        tile_y = math.floor(tile_y / downsampling[0]) * downsampling[0]
+                        tile_height = self._input_size.height - tile_y
+                        map_y -= 1
+                        map_height += 1
+
                 if sides.right:
-                    tile = Box(tile.y, tile.height, self._input_size.width - tile_shape.width, tile.width, tile.sides)
+                    tile_x = self._input_size.width - tile_shape.width
                     map_x = output_shape.width - map_width
 
-                tile_box = Box(tile.y, tile_shape.height, tile.x, tile_shape.width, sides)
+                    if map_x % float(downsampling[1]) > 0:
+                        tile_x = math.floor(tile_x / downsampling[1]) * downsampling[1]
+                        tile_width = self._input_size.width - tile_x
+                        map_x -= 1
+                        map_width += 1
+
+                tile_box = Box(tile_y, tile_height, tile_x, tile_width, sides)
                 embed_box = Box(map_y, map_height, map_x, map_width, sides)
 
                 # filter out duplicates
