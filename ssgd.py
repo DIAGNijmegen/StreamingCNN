@@ -360,7 +360,6 @@ class StreamingSGD(object):
             map_tile_shape = self._tree[self._first_layer].calculate_output_shape(tile_shape,
                                                                                   output_layer=last_layer_stats)
 
-
         # The size of the patch/tile is feature map / divide_in
         #
         if output_shape.width % self._divide_in > 0 or output_shape.height % self._divide_in > 0:
