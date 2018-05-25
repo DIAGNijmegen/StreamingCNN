@@ -98,6 +98,16 @@ class LayerStats(object):
             name=name
         )
 
+    def calculate_valid_input_shape(self, out_shape, recursive=True, recursive_till="", gradient_lost=False):
+        total_padding = self.total_padding
+        valid_output_tile_shape = IOShape(batch=0, channels=0,
+                                          height=out_shape.height
+                                          + total_padding.top + total_padding.bottom,
+                                          width=out_shape.height
+                                          + total_padding.left + total_padding.right)
+        return self.calculate_input_shape(valid_output_tile_shape, True, recursive, recursive_till, gradient_lost)
+
+
     def calculate_input_shape(self, out_shape, valid=False, recursive=True, recursive_till="", gradient_lost=False):
         if not gradient_lost or self.previous is None:
             input_height = out_shape.height * self.downsamples[0] + self.output_lost.top + self.output_lost.bottom
@@ -154,10 +164,10 @@ class LayerStats(object):
         # should probably cache this
         if self.previous is not None:
             prev_lost = self.previous.total_padding
-            return Lost(top=self.padding.top + prev_lost.top,
-                        left=self.padding.left + prev_lost.left,
-                        bottom=self.padding.bottom + prev_lost.bottom,
-                        right=self.padding.right + prev_lost.right)
+            return Lost(top=self.padding.top + math.ceil(prev_lost.top / self.downsamples[0]),
+                        left=self.padding.left + math.ceil(prev_lost.left / self.downsamples[1]),
+                        bottom=self.padding.bottom + math.ceil(prev_lost.bottom / self.downsamples[0]),
+                        right=self.padding.right + math.ceil(prev_lost.right / self.downsamples[1]))
         else:
             return self.padding
 
@@ -337,19 +347,20 @@ class StreamingSGD(object):
         for the forward pass to reconstruct the feature map
         """
         last_layer_stats = self._tree[self._stream_to_layer]
-        total_padding = last_layer_stats.total_padding
         output_shape = last_layer_stats.output_shape
+        total_padding = last_layer_stats.total_padding
         output_tile_shape = IOShape(batch=0, channels=0,
-                                    height=output_shape.height // self._divide_in
-                                    + total_padding.top + total_padding.bottom,
-                                    width=output_shape.width // self._divide_in
-                                    + total_padding.left + total_padding.right)
+                                    height=output_shape.height // self._divide_in,
+                                    width=output_shape.width // self._divide_in)
 
-        tile_shape = last_layer_stats.calculate_input_shape(output_tile_shape, valid=True, gradient_lost=backwards)
+        tile_shape = last_layer_stats.calculate_valid_input_shape(output_tile_shape, gradient_lost=backwards)
         if backwards:
             map_tile_shape = self._tree[self._first_layer].calculate_output_shape(tile_shape,
                                                                                   output_layer=last_layer_stats)
         else:
+            map_tile_shape = self._tree[self._first_layer].calculate_output_shape(tile_shape,
+                                                                                  output_layer=last_layer_stats)
+
             map_tile_shape = output_tile_shape
 
         # The size of the patch/tile is feature map / divide_in
@@ -384,15 +395,29 @@ class StreamingSGD(object):
                               right=(tile.x + tile_shape.width >= self._input_size.width),
                               bottom=(tile.y + tile_shape.height >= self._input_size.height))
 
+                # Move map coordinates based on position (sides) and padding
+                #
+                map_height = map_tile_shape.height
+                map_width = map_tile_shape.width
+                map_x += last_layer_stats.total_padding.left
+                map_y += last_layer_stats.total_padding.top
+                if sides.left:
+                    map_width += total_padding.left
+                    map_x = 0
+                if sides.top:
+                    map_height += total_padding.top
+                    map_y = 0
                 if sides.bottom:
+                    map_height += total_padding.bottom
                     tile = Box(self._input_size.height - tile_shape.height, tile.height, tile.x, tile.width, tile.sides)
-                    map_y = output_shape.height - map_tile_shape.height
+                    map_y = output_shape.height - map_height
                 if sides.right:
+                    map_width += total_padding.right
                     tile = Box(tile.y, tile.height, self._input_size.width - tile_shape.width, tile.width, tile.sides)
-                    map_x = output_shape.width - map_tile_shape.width
+                    map_x = output_shape.width - map_width
 
                 tile_box = Box(tile.y, tile_shape.height, tile.x, tile_shape.width, sides)
-                embed_box = Box(map_y, map_tile_shape.height, map_x, map_tile_shape.width, sides)
+                embed_box = Box(map_y, map_height, map_x, map_width, sides)
 
                 # filter out duplicates
                 exists = False
