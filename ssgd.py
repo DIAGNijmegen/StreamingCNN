@@ -116,7 +116,7 @@ class LayerStats(object):
             input_height = out_shape.height * self.downsamples[0] + self.gradient_lost.top + self.gradient_lost.bottom
             input_width = out_shape.width * self.downsamples[1] + self.gradient_lost.left + self.gradient_lost.right
 
-        if not valid:
+        if valid:
             input_height -= self.padding.top + self.padding.bottom
             input_width -= self.padding.left + self.padding.right
 
@@ -348,7 +348,6 @@ class StreamingSGD(object):
         """
         last_layer_stats = self._tree[self._stream_to_layer]
         output_shape = last_layer_stats.output_shape
-        total_padding = last_layer_stats.total_padding
         output_tile_shape = IOShape(batch=0, channels=0,
                                     height=output_shape.height // self._divide_in,
                                     width=output_shape.width // self._divide_in)
@@ -361,7 +360,6 @@ class StreamingSGD(object):
             map_tile_shape = self._tree[self._first_layer].calculate_output_shape(tile_shape,
                                                                                   output_layer=last_layer_stats)
 
-            map_tile_shape = output_tile_shape
 
         # The size of the patch/tile is feature map / divide_in
         #
@@ -399,20 +397,10 @@ class StreamingSGD(object):
                 #
                 map_height = map_tile_shape.height
                 map_width = map_tile_shape.width
-                map_x += last_layer_stats.total_padding.left
-                map_y += last_layer_stats.total_padding.top
-                if sides.left:
-                    map_width += total_padding.left
-                    map_x = 0
-                if sides.top:
-                    map_height += total_padding.top
-                    map_y = 0
                 if sides.bottom:
-                    map_height += total_padding.bottom
                     tile = Box(self._input_size.height - tile_shape.height, tile.height, tile.x, tile.width, tile.sides)
                     map_y = output_shape.height - map_height
                 if sides.right:
-                    map_width += total_padding.right
                     tile = Box(tile.y, tile.height, self._input_size.width - tile_shape.width, tile.width, tile.sides)
                     map_x = output_shape.width - map_width
 
@@ -464,9 +452,9 @@ class StreamingSGD(object):
                 #
                 self._layer_should_detach = False
                 output = self.model.forward(data, self._stream_to_layer)
-                # if i < 10:
-                #    print(output[:,0].data.numpy(), tile)
-                tile_output, _ = self._tree[self._stream_to_layer].trim_to_valid_output(output, tile)
+                tile_output, tile_lost = self._tree[self._stream_to_layer].trim_to_valid_output(output, tile)
+                valid_map_c = Box(map_c.y + tile_lost.top, map_c.height - tile_lost.bottom - tile_lost.top,
+                                  map_c.x + tile_lost.left, map_c.width - tile_lost.right - tile_lost.left, None)
                 output_size = self._tree[self._stream_to_layer].output_shape
 
                 # Create (to be reconstructed) feature_map placeholder variable if it doesn't exists yet
@@ -486,8 +474,8 @@ class StreamingSGD(object):
                 # Save the output of the network in the relevant part of the feature_map
                 #
                 feature_map[:, :,
-                            int(map_c.y):int(map_c.y + map_c.height),
-                            int(map_c.x):int(map_c.x + map_c.width)] = tile_output
+                            int(valid_map_c.y):int(valid_map_c.y + valid_map_c.height),
+                            int(valid_map_c.x):int(valid_map_c.x + valid_map_c.width)] = tile_output
 
                 tile_output = None  # trying memory management
 
