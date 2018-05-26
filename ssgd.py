@@ -652,9 +652,9 @@ class StreamingSGD(object):
             print("Everything reconstructed:\n", self._check_gradient_size(self._filled))
 
         if fill_gradients:
-            return None  # trimmed_full_gradient
-        else:
             return self._gradients
+        else:
+            return None
 
     # --------------------------
     # Gradient utility functions
