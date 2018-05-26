@@ -105,8 +105,8 @@ class LayerStats(object):
                                           + total_padding.top + total_padding.bottom,
                                           width=out_shape.height
                                           + total_padding.left + total_padding.right)
-        return self.calculate_input_shape(valid_output_tile_shape, True, recursive, recursive_till, gradient_lost)
 
+        return self.calculate_input_shape(valid_output_tile_shape, True, recursive, recursive_till, gradient_lost)
 
     def calculate_input_shape(self, out_shape, valid=False, recursive=True, recursive_till="", gradient_lost=False):
         if not gradient_lost or self.previous is None:
@@ -428,7 +428,6 @@ class StreamingSGD(object):
                 for e_b in embed_boxes:
                     if e_b.x == embed_box.x and e_b.y == embed_box.y:
                         exists = True
-
                 if exists:
                     continue
 
@@ -638,7 +637,6 @@ class StreamingSGD(object):
 
             # Needed for memory control
             #
-            # del self._outputs
             del data
             del tile_map_grad
 
@@ -757,11 +755,10 @@ class StreamingSGD(object):
             output = self._layer_outputs[layer]
 
             self._save_gradients()
-
             output.backward(gradient=gradient, retain_graph=True)
 
             # we carried the gradient to the input of current layer
-            # check if the previous layer has a gradient at all 
+            # check if the previous layer has a gradient at all
             # (eg input-layer will have None)
             if self._layer_inputs[layer].grad is not None:
                 next_gradient = self._layer_inputs[layer].grad.clone()
