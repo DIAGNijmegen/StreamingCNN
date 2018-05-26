@@ -76,7 +76,7 @@ class LayerStats(object):
         p_bottom = math.ceil(lost_due_kernel_column) + lost_due_stride_column
 
         lost_this_layer = Lost(top=p_top, left=p_left, bottom=p_bottom, right=p_right)
-        grad_lost_this_layer = Lost(top=p_top * 2, left=p_left * 2, bottom=p_bottom * 2, right=p_right * 2)
+        grad_lost_this_layer = Lost(top=p_top * 2 + c_padding[1], left=p_left * 2 + c_padding[0], bottom=p_bottom * 2 + c_padding[0], right=p_right * 2 + c_padding[1])
         padding_this_layer = Lost(top=c_padding[1], left=c_padding[0], bottom=c_padding[1], right=c_padding[0])
 
         next_shape = [1, output_channels,
