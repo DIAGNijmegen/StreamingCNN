@@ -391,7 +391,7 @@ class StreamingSGD(object):
 
                 # Move map coordinates based on position (sides) and padding
                 #
-                # ERROR: TODO: the problem is that the tile on the right edge not always fits on the
+                # The problem is that the tile on the right edge not always fits on the
                 # downsampling grid. The best solution would be to recalculate output_lost for this tile
                 # this would mean output-lost has to be tile specific. It currently is layer specific.
                 map_height = map_tile_shape.height
@@ -401,20 +401,20 @@ class StreamingSGD(object):
                 tile_width = tile_shape.width
 
                 if sides.bottom:
+                    tile_y = self._input_size.height - tile_height
                     map_y = output_shape.height - map_height
-                    tile_y = self._input_size.height - tile_shape.height
 
-                    if map_y % float(downsampling[0]) > 0:
+                    if tile_y % float(downsampling[0]) > 0:
                         tile_y = math.floor(tile_y / downsampling[0]) * downsampling[0]
                         tile_height = self._input_size.height - tile_y
                         map_y -= 1
                         map_height += 1
 
                 if sides.right:
-                    tile_x = self._input_size.width - tile_shape.width
+                    tile_x = self._input_size.width - tile_width
                     map_x = output_shape.width - map_width
 
-                    if map_x % float(downsampling[1]) > 0:
+                    if tile_x % float(downsampling[1]) > 0:
                         tile_x = math.floor(tile_x / downsampling[1]) * downsampling[1]
                         tile_width = self._input_size.width - tile_x
                         map_x -= 1
