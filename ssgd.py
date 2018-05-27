@@ -407,8 +407,11 @@ class StreamingSGD(object):
                     if tile_y % float(downsampling[0]) > 0:
                         tile_y = math.floor(tile_y / downsampling[0]) * downsampling[0]
                         tile_height = self._input_size.height - tile_y
-                        map_y -= 1
-                        map_height += 1
+                        bottom_tile_shape = IOShape(0, 0, tile_height, tile_height)
+                        bottom_shape = self._tree[self._first_layer].calculate_output_shape(bottom_tile_shape,
+                                                                                            output_layer=last_layer_stats)
+                        map_height = bottom_shape.height
+                        map_y = output_shape.height - map_height
 
                 if sides.right:
                     tile_x = self._input_size.width - tile_width
@@ -417,8 +420,11 @@ class StreamingSGD(object):
                     if tile_x % float(downsampling[1]) > 0:
                         tile_x = math.floor(tile_x / downsampling[1]) * downsampling[1]
                         tile_width = self._input_size.width - tile_x
-                        map_x -= 1
-                        map_width += 1
+                        right_tile_shape = IOShape(0, 0, tile_width, tile_width)
+                        right_shape = self._tree[self._first_layer].calculate_output_shape(right_tile_shape,
+                                                                                           output_layer=last_layer_stats)
+                        map_width = right_shape.width
+                        map_x = output_shape.width - map_width
 
                 tile_box = Box(tile_y, tile_height, tile_x, tile_width, sides)
                 embed_box = Box(map_y, map_height, map_x, map_width, sides)
