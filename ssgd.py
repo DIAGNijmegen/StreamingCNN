@@ -33,11 +33,15 @@ class LayerStats(object):
     """This class is responsible for calculating layer specific statistics,
     such as padding, output lost, gradient invalidated by convolution / zero-padding
     """
-    def __init__(self, layer, padding, output_lost, downsamples, gradient_lost, output_shape, name, streaming=False):
+    def __init__(self, layer, padding, output_lost, kernel_lost, stride_lost, stride, kernel_size, downsamples, gradient_lost, output_shape, name, streaming=False):
         self.next = None
         self.previous = None
         self.padding = padding
         self.output_lost = output_lost
+        self.kernel_lost = kernel_lost
+        self.stride_lost = stride_lost
+        self.stride = stride
+        self.kernel_size = kernel_size
         self.gradient_lost = gradient_lost
         self.output_shape = output_shape
         self.downsamples = downsamples
@@ -70,28 +74,46 @@ class LayerStats(object):
         lost_due_kernel_column = (kernel_size[1] - cur_stride[1]) / 2
         lost_due_stride_column = (input_shape[3] + c_padding[1] * 2 - kernel_size[1]) % cur_stride[1]
 
-        p_left = math.floor(lost_due_kernel_row)
-        p_right = math.ceil(lost_due_kernel_row) + lost_due_stride_row
-        p_top = math.floor(lost_due_kernel_column)
-        p_bottom = math.ceil(lost_due_kernel_column) + lost_due_stride_column
+        kernel_lost = Lost(top=math.floor(lost_due_kernel_row),
+                           left=math.floor(lost_due_kernel_column),
+                           bottom=math.ceil(lost_due_kernel_row),
+                           right=math.ceil(lost_due_kernel_column))
 
-        lost_this_layer = Lost(top=p_top, left=p_left, bottom=p_bottom, right=p_right)
-        grad_lost_this_layer = Lost(top=p_top * 2 + c_padding[0], left=p_left * 2 + c_padding[1], bottom=p_bottom * 2 + c_padding[0], right=p_right * 2 + c_padding[1])
+        stride_lost = Lost(top=0, left=0, bottom=lost_due_stride_row, right=lost_due_stride_column)
+
+        lost_this_layer = Lost(top=kernel_lost.top + stride_lost.top,
+                               left=kernel_lost.left + stride_lost.left,
+                               bottom=kernel_lost.bottom + stride_lost.bottom,
+                               right=kernel_lost.right + stride_lost.right)
+
+        # grad_lost_this_layer = Lost(top=lost_this_layer.top * 2, left=lost_this_layer.left * 2,
+        #                             bottom=lost_this_layer.bottom * 2, right=lost_this_layer.right * 2)
+        # print("before", grad_lost_this_layer)
+        grad_lost_this_layer = Lost(top=kernel_lost.top * 2 + stride_lost.top + c_padding[0],
+                                    left=kernel_lost.left * 2 + stride_lost.left + c_padding[1],
+                                    bottom=kernel_lost.bottom * 2 + stride_lost.bottom + c_padding[0],
+                                    right=kernel_lost.right * 2 + stride_lost.right + c_padding[1])
+        # print("after", grad_lost_this_layer)
         padding_this_layer = Lost(top=c_padding[0], left=c_padding[1], bottom=c_padding[0], right=c_padding[1])
 
         next_shape = [1, output_channels,
-                      float(input_shape[2] - p_top - p_bottom + c_padding[0] * 2),
-                      float(input_shape[3] - p_left - p_right + c_padding[1] * 2)]
+                      float(input_shape[2] - lost_this_layer.top - lost_this_layer.bottom + c_padding[0] * 2),
+                      float(input_shape[3] - lost_this_layer.left - lost_this_layer.right + c_padding[1] * 2)]
 
         next_shape[2] //= cur_stride[0]
         next_shape[3] //= cur_stride[1]
 
         next_shape = IOShape(1, next_shape[1], next_shape[2], next_shape[3])
+        # print(name, next_shape, lost_this_layer)
 
         return cls(
             layer=layer,
             output_shape=next_shape,
             output_lost=lost_this_layer,
+            kernel_lost=kernel_lost,
+            stride_lost=stride_lost,
+            stride=cur_stride,
+            kernel_size=kernel_size,
             padding=padding_this_layer,
             gradient_lost=grad_lost_this_layer,
             downsamples=torch.tensor(downsamples, dtype=torch.float),
@@ -112,13 +134,21 @@ class LayerStats(object):
         if not gradient_lost or self.previous is None:
             input_height = out_shape.height * self.downsamples[0] + self.output_lost.top + self.output_lost.bottom
             input_width = out_shape.width * self.downsamples[1] + self.output_lost.left + self.output_lost.right
+
+            input_height = out_shape.height * self.downsamples[0] + self.kernel_lost.top + self.kernel_lost.bottom - self.padding.top - self.padding.bottom
+            input_height = math.floor((input_height - self.kernel_size[0]) / self.stride[0]) * self.stride[0] + self.kernel_size[0] + self.stride_lost.bottom
+
+            input_width = out_shape.width * self.downsamples[1] + self.kernel_lost.left + self.kernel_lost.right - self.padding.left - self.padding.right
+            input_width = math.floor((input_width - self.kernel_size[1]) / self.stride[1]) * self.stride[1] + self.kernel_size[1] + self.stride_lost.right
         else:
             input_height = out_shape.height * self.downsamples[0] + self.gradient_lost.top + self.gradient_lost.bottom
             input_width = out_shape.width * self.downsamples[1] + self.gradient_lost.left + self.gradient_lost.right
 
-        if valid:
             input_height -= self.padding.top + self.padding.bottom
             input_width -= self.padding.left + self.padding.right
+        # if valid:
+
+        # print(input_height, input_width)
 
         shape = IOShape(batch=out_shape.batch,
                         channels=out_shape.channels,
@@ -133,14 +163,19 @@ class LayerStats(object):
 
     def calculate_output_shape(self, in_shape, output_layer):
         next_layer = self
+        output_lost = []
+        grad_output_lost = []
         while next_layer is not None:
-            in_shape = self.stats_with_layer(next_layer.layer, in_shape, next_layer.name).output_shape
+            stats = self.stats_with_layer(next_layer.layer, in_shape, next_layer.name)
+            in_shape = stats.output_shape
+            output_lost.append(stats.output_lost)
+            grad_output_lost.append(stats.gradient_lost)
 
             if next_layer == output_layer:
                 break
             next_layer = next_layer.next
 
-        return in_shape
+        return in_shape, output_lost, grad_output_lost
 
     def calculate_input_coords_for_output(self, y: int, x: int, output_layer):
         total_downsamples = output_layer.downsampling_upto(self.name)
@@ -350,13 +385,38 @@ class StreamingSGD(object):
         output_shape = last_layer_stats.output_shape
         downsampling = last_layer_stats.total_downsampling
         output_tile_shape = IOShape(batch=0, channels=0,
-                                    height=output_shape.height // self._divide_in,
-                                    width=output_shape.width // self._divide_in)
+                                    height=(output_shape.height // self._divide_in),
+                                    width=(output_shape.width // self._divide_in))
 
         tile_shape = last_layer_stats.calculate_valid_input_shape(output_tile_shape, gradient_lost=backwards)
 
-        map_tile_shape = self._tree[self._first_layer].calculate_output_shape(tile_shape,
-                                                                              output_layer=last_layer_stats)
+        map_tile_shape, output_lost, grad_output_lost = self._tree[self._first_layer].calculate_output_shape(tile_shape,
+                                                                                                             output_layer=last_layer_stats)
+
+        if backwards:
+            print('back', tile_shape, map_tile_shape)
+
+            # to be sure that output_lost is the same everywhere we should do a normal calculate input shape:
+            new_tile_shape = last_layer_stats.calculate_input_shape(map_tile_shape, valid=False, gradient_lost=False)
+
+            map_tile_shape, output_lost, grad_output_lost = \
+                self._tree[self._first_layer].calculate_output_shape(new_tile_shape, output_layer=last_layer_stats)
+
+            if new_tile_shape.height < tile_shape.height or new_tile_shape.width < tile_shape.width:
+                map_tile_shape = IOShape(0, 0, map_tile_shape.height + 1, map_tile_shape.width + 1)
+                tile_shape = last_layer_stats.calculate_input_shape(map_tile_shape, valid=False, gradient_lost=False)
+                map_tile_shape, output_lost, grad_output_lost = \
+                    self._tree[self._first_layer].calculate_output_shape(tile_shape, output_layer=last_layer_stats)
+            else:
+                tile_shape = new_tile_shape
+
+            print("new", tile_shape, map_tile_shape)
+
+        next_layer = self._tree[self._first_layer]
+        for i in range(len(output_lost)):
+            if next_layer.output_lost != output_lost[i]:
+                print("Lost diff!", next_layer.name, next_layer.output_lost, "tile:", output_lost[i])
+            next_layer = next_layer.next
 
         # The size of the patch/tile is feature map / divide_in
         #
@@ -405,26 +465,49 @@ class StreamingSGD(object):
                     map_y = output_shape.height - map_height
 
                     if tile_y % float(downsampling[0]) > 0:
-                        tile_y = math.floor(tile_y / downsampling[0]) * downsampling[0]
+                        map_y = math.floor(tile_y / downsampling[0])
+                        tile_y = self._tree[self._first_layer].calculate_input_coords_for_output(
+                            y=map_y, x=map_x, output_layer=last_layer_stats).y
+
                         tile_height = self._input_size.height - tile_y
                         bottom_tile_shape = IOShape(0, 0, tile_height, tile_height)
-                        bottom_shape = self._tree[self._first_layer].calculate_output_shape(bottom_tile_shape,
-                                                                                            output_layer=last_layer_stats)
-                        map_height = bottom_shape.height
-                        map_y = output_shape.height - map_height
+                        bottom_shape, output_lost, g_o_l = self._tree[self._first_layer].calculate_output_shape(bottom_tile_shape,
+                                                                                                                output_layer=last_layer_stats)
 
+                        next_layer = self._tree[self._first_layer]
+                        print()
+                        for i in range(len(g_o_l)):
+                            if next_layer.gradient_lost != g_o_l[i]:
+                                print("Output lost difference!", next_layer.name, next_layer.output_lost, output_lost[i])
+
+                        map_height = bottom_shape.height
+
+                        if map_y + map_height != output_shape.height:
+                            print("Warning: the reconstructed feature map size is smaller or bigger than the feature map of the whole image.",
+                                  "This can cause small differences in gradients")
                 if sides.right:
                     tile_x = self._input_size.width - tile_width
                     map_x = output_shape.width - map_width
 
                     if tile_x % float(downsampling[1]) > 0:
-                        tile_x = math.floor(tile_x / downsampling[1]) * downsampling[1]
+                        map_x = math.floor(tile_x / downsampling[1])
+                        tile_x = self._tree[self._first_layer].calculate_input_coords_for_output(
+                            y=map_y, x=map_x, output_layer=last_layer_stats).x
+
                         tile_width = self._input_size.width - tile_x
                         right_tile_shape = IOShape(0, 0, tile_width, tile_width)
-                        right_shape = self._tree[self._first_layer].calculate_output_shape(right_tile_shape,
-                                                                                           output_layer=last_layer_stats)
+                        right_shape, output_lost, g_o_l = self._tree[self._first_layer].calculate_output_shape(right_tile_shape,
+                                                                                                               output_layer=last_layer_stats)
+                        next_layer = self._tree[self._first_layer]
+                        print()
+                        for i in range(len(g_o_l)):
+                            if next_layer.gradient_lost != g_o_l[i]:
+                                print("Output lost difference!", next_layer.name, next_layer.output_lost, output_lost[i])
+
                         map_width = right_shape.width
-                        map_x = output_shape.width - map_width
+                        if map_x + map_width > output_shape.width:
+                            print("Warning: the reconstructed feature map size is bigger than the feature map of the whole image.",
+                                  "This can cause small differences in gradients.")
 
                 tile_box = Box(tile_y, tile_height, tile_x, tile_width, sides)
                 embed_box = Box(map_y, map_height, map_x, map_width, sides)
