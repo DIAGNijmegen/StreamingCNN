@@ -385,8 +385,8 @@ class StreamingSGD(object):
         output_shape = last_layer_stats.output_shape
         downsampling = last_layer_stats.total_downsampling
         output_tile_shape = IOShape(batch=0, channels=0,
-                                    height=(output_shape.height // self._divide_in),
-                                    width=(output_shape.width // self._divide_in))
+                                    height=output_shape.height // self._divide_in,
+                                    width=output_shape.width // self._divide_in)
 
         tile_shape = last_layer_stats.calculate_valid_input_shape(output_tile_shape, gradient_lost=backwards)
 
