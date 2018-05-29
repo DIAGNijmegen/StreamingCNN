@@ -70,9 +70,9 @@ class LayerStats(object):
         # Equations of the paper
         #
         lost_due_kernel_row = (kernel_size[0] - cur_stride[0]) / 2
-        lost_due_stride_row = (input_shape[2] + c_padding[0] * 2 - kernel_size[0]) % cur_stride[0]
+        lost_due_stride_row = (input_shape[2] - kernel_size[0]) % cur_stride[0]
         lost_due_kernel_column = (kernel_size[1] - cur_stride[1]) / 2
-        lost_due_stride_column = (input_shape[3] + c_padding[1] * 2 - kernel_size[1]) % cur_stride[1]
+        lost_due_stride_column = (input_shape[3] - kernel_size[1]) % cur_stride[1]
 
         kernel_lost = Lost(top=math.floor(lost_due_kernel_row),
                            left=math.floor(lost_due_kernel_column),
@@ -431,15 +431,9 @@ class StreamingSGD(object):
         embed_boxes = []
         for y in range(0, int(output_shape.height), int(output_tile_shape.height)):
             for x in range(0, int(output_shape.width), int(output_tile_shape.width)):
-                map_x = x - last_layer_stats.padding.left
-                map_y = y - last_layer_stats.padding.top
+                map_x = max(x - last_layer_stats.total_padding.left, 0)
+                map_y = max(y - last_layer_stats.total_padding.top, 0)
 
-                if backwards:
-                    map_x -= last_layer_stats.total_output_lost.left
-                    map_y -= last_layer_stats.total_output_lost.top
-
-                map_x = max(0, map_x)
-                map_y = max(0, map_y)
                 tile_y, _, tile_x, _, _ = self._tree[self._first_layer].calculate_input_coords_for_output(
                     y=map_y, x=map_x, output_layer=last_layer_stats)
 
