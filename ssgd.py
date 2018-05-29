@@ -833,7 +833,7 @@ class StreamingSGD(object):
     #
     def _backward_sequential(self, layer, gradient, fill_gradients):
         output_layer = self._tree[self._stream_to_layer]
-        while gradient is not None:
+        while True:
             layerstats = self._tree[layer]
             output = self._layer_outputs[layer]
 
