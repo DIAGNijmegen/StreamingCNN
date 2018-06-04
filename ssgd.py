@@ -86,14 +86,11 @@ class LayerStats(object):
                                bottom=kernel_lost.bottom + stride_lost.bottom,
                                right=kernel_lost.right + stride_lost.right)
 
-        # grad_lost_this_layer = Lost(top=lost_this_layer.top * 2, left=lost_this_layer.left * 2,
-        #                             bottom=lost_this_layer.bottom * 2, right=lost_this_layer.right * 2)
-        # print("before", grad_lost_this_layer)
         grad_lost_this_layer = Lost(top=kernel_lost.top * 2 + stride_lost.top + c_padding[0],
                                     left=kernel_lost.left * 2 + stride_lost.left + c_padding[1],
                                     bottom=kernel_lost.bottom * 2 + stride_lost.bottom + c_padding[0],
                                     right=kernel_lost.right * 2 + stride_lost.right + c_padding[1])
-        # print("after", grad_lost_this_layer)
+
         padding_this_layer = Lost(top=c_padding[0], left=c_padding[1], bottom=c_padding[0], right=c_padding[1])
 
         next_shape = [1, output_channels,
@@ -104,7 +101,6 @@ class LayerStats(object):
         next_shape[3] //= cur_stride[1]
 
         next_shape = IOShape(1, next_shape[1], next_shape[2], next_shape[3])
-        # print(name, next_shape, lost_this_layer)
 
         return cls(
             layer=layer,
