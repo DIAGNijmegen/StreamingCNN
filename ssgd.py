@@ -3,9 +3,265 @@ Author: Hans Pinckaers
 April 11, 2018
 """
 import math
+from collections import namedtuple
+
 import torch
+
 from tqdm import tqdm
-# from IPython.core.debugger import set_trace
+
+# Utility named tuples, makes code more readable
+#
+class Box(namedtuple('Box', 'y height x width sides')):
+    def __str__(self):
+        return '(Box x:%5.1f y:%5.1f width:%5.1f height:%5.1f)' % (self.x, self.y, self.width, self.height)
+
+class Sides(namedtuple('Sides', 'left top right bottom')):
+    def __str__(self):
+        return '(Sides left:%r top:%r right:%r bottom:%r' % (self.left, self.top, self.right, self.bottom)
+
+class IOShape(namedtuple('IOShape', 'batch channels height width')):
+    def __str__(self):
+        return '(IOShape batch:%2.1f channels:%2.1f height:%2.1f width:%2.1f)' % \
+            (self.batch, self.channels, self.height, self.width)
+
+class Lost(namedtuple('Lost', 'top left bottom right')):
+    def __str__(self):
+        return '(Lost top:%2.1f left:%2.1f bottom:%2.1f right:%2.1f)' % (self.top, self.left, self.bottom, self.right)
+
+class LayerStats(object):
+    """This class is responsible for calculating layer specific statistics,
+    such as padding, output lost, gradient invalidated by convolution / zero-padding
+    """
+    def __init__(self, layer, padding, output_lost, kernel_lost, stride_lost, stride, kernel_size, downsamples, gradient_lost, output_shape, name, streaming=False):
+        self.next = None
+        self.previous = None
+        self.padding = padding
+        self.output_lost = output_lost
+        self.kernel_lost = kernel_lost
+        self.stride_lost = stride_lost
+        self.stride = stride
+        self.kernel_size = kernel_size
+        self.gradient_lost = gradient_lost
+        self.output_shape = output_shape
+        self.downsamples = downsamples
+        self.layer = layer
+        self.name = name
+        self.streaming = streaming
+
+    @classmethod
+    def stats_with_layer(cls, layer, input_shape, name):
+        output_channels = input_shape[1]
+
+        cur_stride = layer.stride
+        kernel_size = layer.kernel_size
+        c_padding = layer.padding
+
+        if isinstance(layer, torch.nn.MaxPool2d):
+            cur_stride = [layer.stride, layer.stride]
+            kernel_size = (kernel_size, kernel_size)
+        else:
+            output_channels = layer.out_channels
+
+        if isinstance(layer.padding, int):
+            c_padding = [layer.padding, layer.padding]
+
+        downsamples = cur_stride
+
+        # Equations of the paper
+        #
+        lost_due_kernel_row = (kernel_size[0] - cur_stride[0]) / 2
+        lost_due_stride_row = (input_shape[2] - kernel_size[0]) % cur_stride[0]
+        lost_due_kernel_column = (kernel_size[1] - cur_stride[1]) / 2
+        lost_due_stride_column = (input_shape[3] - kernel_size[1]) % cur_stride[1]
+
+        kernel_lost = Lost(top=math.floor(lost_due_kernel_row),
+                           left=math.floor(lost_due_kernel_column),
+                           bottom=math.ceil(lost_due_kernel_row),
+                           right=math.ceil(lost_due_kernel_column))
+
+        stride_lost = Lost(top=0, left=0, bottom=lost_due_stride_row, right=lost_due_stride_column)
+
+        lost_this_layer = Lost(top=kernel_lost.top + stride_lost.top,
+                               left=kernel_lost.left + stride_lost.left,
+                               bottom=kernel_lost.bottom + stride_lost.bottom,
+                               right=kernel_lost.right + stride_lost.right)
+
+        grad_lost_this_layer = Lost(top=kernel_lost.top * 2 + stride_lost.top + c_padding[0],
+                                    left=kernel_lost.left * 2 + stride_lost.left + c_padding[1],
+                                    bottom=kernel_lost.bottom * 2 + stride_lost.bottom + c_padding[0],
+                                    right=kernel_lost.right * 2 + stride_lost.right + c_padding[1])
+
+        padding_this_layer = Lost(top=c_padding[0], left=c_padding[1], bottom=c_padding[0], right=c_padding[1])
+
+        next_shape = [1, output_channels,
+                      float(input_shape[2] - lost_this_layer.top - lost_this_layer.bottom + c_padding[0] * 2),
+                      float(input_shape[3] - lost_this_layer.left - lost_this_layer.right + c_padding[1] * 2)]
+
+        next_shape[2] //= cur_stride[0]
+        next_shape[3] //= cur_stride[1]
+
+        next_shape = IOShape(1, next_shape[1], next_shape[2], next_shape[3])
+
+        return cls(
+            layer=layer,
+            output_shape=next_shape,
+            output_lost=lost_this_layer,
+            kernel_lost=kernel_lost,
+            stride_lost=stride_lost,
+            stride=cur_stride,
+            kernel_size=kernel_size,
+            padding=padding_this_layer,
+            gradient_lost=grad_lost_this_layer,
+            downsamples=torch.tensor(downsamples, dtype=torch.float),
+            name=name
+        )
+
+    def calculate_valid_input_shape(self, out_shape, recursive=True, recursive_till="", gradient_lost=False):
+        total_padding = self.total_padding
+        valid_output_tile_shape = IOShape(batch=0, channels=0,
+                                          height=out_shape.height
+                                          + total_padding.top + total_padding.bottom,
+                                          width=out_shape.height
+                                          + total_padding.left + total_padding.right)
+
+        return self.calculate_input_shape(valid_output_tile_shape, True, recursive, recursive_till, gradient_lost)
+
+    def calculate_input_shape(self, out_shape, valid=False, recursive=True, recursive_till="", gradient_lost=False):
+        if not gradient_lost or self.previous is None:
+            input_height = out_shape.height * self.downsamples[0] + self.output_lost.top + self.output_lost.bottom
+            input_width = out_shape.width * self.downsamples[1] + self.output_lost.left + self.output_lost.right
+
+            input_height = out_shape.height * self.downsamples[0] + self.kernel_lost.top + self.kernel_lost.bottom - self.padding.top - self.padding.bottom
+            input_height = math.floor((input_height - self.kernel_size[0]) / self.stride[0]) * self.stride[0] + self.kernel_size[0] + self.stride_lost.bottom
+
+            input_width = out_shape.width * self.downsamples[1] + self.kernel_lost.left + self.kernel_lost.right - self.padding.left - self.padding.right
+            input_width = math.floor((input_width - self.kernel_size[1]) / self.stride[1]) * self.stride[1] + self.kernel_size[1] + self.stride_lost.right
+        else:
+            input_height = out_shape.height * self.downsamples[0] + self.gradient_lost.top + self.gradient_lost.bottom
+            input_width = out_shape.width * self.downsamples[1] + self.gradient_lost.left + self.gradient_lost.right
+
+            input_height -= self.padding.top + self.padding.bottom
+            input_width -= self.padding.left + self.padding.right
+
+        # print(input_height, input_width)
+
+        shape = IOShape(batch=out_shape.batch,
+                        channels=out_shape.channels,
+                        height=input_height,
+                        width=input_width)
+
+        if recursive and self.previous is not None:
+            return self.previous.calculate_input_shape(shape, valid, (self.previous is not recursive_till),
+                                                       recursive_till, gradient_lost)
+        else:
+            return shape
+
+    def calculate_output_shape(self, in_shape, output_layer):
+        next_layer = self
+        output_lost = []
+        grad_output_lost = []
+        while next_layer is not None:
+            stats = self.stats_with_layer(next_layer.layer, in_shape, next_layer.name)
+            in_shape = stats.output_shape
+            output_lost.append(stats.output_lost)
+            grad_output_lost.append(stats.gradient_lost)
+
+            if next_layer == output_layer:
+                break
+            next_layer = next_layer.next
+
+        return in_shape, output_lost, grad_output_lost
+
+    def output_to_input_coords(self, y: int, x: int, output_layer):
+        total_downsamples = output_layer.downsampling_upto(self.name)
+        tile_x = x * total_downsamples[1] * self.downsamples[1]
+        tile_y = y * total_downsamples[0] * self.downsamples[0]
+        return Box(y=max(tile_y, 0), height=0, x=max(tile_x, 0), width=0, sides=None)
+
+    def output_to_output_coords(self, y: int, x: int, output_layer):
+        total_downsamples = output_layer.downsampling_upto(self.name)
+        tile_x = x * total_downsamples[1]
+        tile_y = y * total_downsamples[0]
+        return Box(y=max(tile_y, 0), height=0, x=max(tile_x, 0), width=0, sides=None)
+
+    @property
+    def total_downsampling(self) -> Lost:
+        # should probably cache this
+        return self.downsampling_upto()
+
+    def downsampling_upto(self, until_layer=None):
+        if self.name == until_layer or self.previous is None:
+            return torch.FloatTensor([1., 1.])
+        else:
+            return self.downsamples * self.previous.downsampling_upto(until_layer)
+
+    @property
+    def total_padding(self) -> Lost:
+        # should probably cache this
+        if self.previous is not None:
+            prev_lost = self.previous.total_padding
+            return Lost(top=self.padding.top + math.ceil(prev_lost.top / self.downsamples[0]),
+                        left=self.padding.left + math.ceil(prev_lost.left / self.downsamples[1]),
+                        bottom=self.padding.bottom + math.ceil(prev_lost.bottom / self.downsamples[0]),
+                        right=self.padding.right + math.ceil(prev_lost.right / self.downsamples[1]))
+        else:
+            return self.padding
+
+    def total_gradient_lost(self, output_layer) -> Lost:
+        if self.name == output_layer or self.next is None:
+            return Lost(0, 0, 0, 0)
+        else:
+            return self.next._total_gradient_lost(output_layer)
+
+    def _total_gradient_lost(self, output_layer=None) -> Lost:
+        # should probably cache this
+        if self.name == output_layer:
+            return self.gradient_lost
+        elif self.next is not None:
+            next_lost = self.next._total_gradient_lost(output_layer)
+            return Lost(top=self.gradient_lost.top + next_lost.top * self.downsamples[0],
+                        left=self.gradient_lost.left + next_lost.left * self.downsamples[1],
+                        bottom=self.gradient_lost.bottom + next_lost.bottom * self.downsamples[0],
+                        right=self.gradient_lost.right + next_lost.right * self.downsamples[1])
+        else:
+            return self.gradient_lost
+
+    @staticmethod
+    def _trim_tensor_with_lost(tensor, tile, lost):
+        l_left = lost.left
+        l_right = lost.right
+        l_top = lost.top
+        l_bottom = lost.bottom
+
+        if tile.sides.left:
+            l_left = 0
+        if tile.sides.top:
+            l_top = 0
+        if tile.sides.right:
+            l_right = 0
+        if tile.sides.bottom:
+            l_bottom = 0
+
+        tensor = tensor[:, :,
+                        int(l_top):int(tensor.shape[2] - l_bottom),
+                        int(l_left):int(tensor.shape[3] - l_right)]
+        return tensor, Lost(l_top, l_left, l_bottom, l_right)
+
+    def trim_to_valid_output(self, output, tile):
+        return self._trim_tensor_with_lost(output, tile, self.total_padding)
+
+    def trim_to_valid_gradient(self, gradient, output_layer, tile):
+        total_grad_lost = self.total_gradient_lost(output_layer)
+
+        total_padding = self.total_padding
+
+        total_lost = Lost(top=total_grad_lost.top + total_padding.top,
+                          left=total_grad_lost.left + total_padding.left,
+                          bottom=total_grad_lost.bottom + total_padding.bottom,
+                          right=total_grad_lost.right + total_padding.right)
+
+        return self._trim_tensor_with_lost(gradient, tile, total_lost)
+
 
 class StreamingSGD(object):
     """
@@ -13,63 +269,67 @@ class StreamingSGD(object):
     until the configured layer index, after that the feature map is run normally until
     the end of the network. The same happens in de backwards pass.
     """
-
-    def __init__(self, model):
-        self.model = model
-
-    def configure(self, layers, stop_index, input_shape, divide_in, cuda=False, verbose=False):
+    def __init__(self, model, stream_to_layer, input_shape, divide_in, cuda=False, verbose=False):
         """Configures the class
 
         Function calculates the coordinates of the forward and backward tiles.
 
         Args:
-            layers: modules of the model
-            stop_index: An index of layers indicating which layer we will switch to normal SGD
+            stream_to_layer: An identifier of the layer indicating which layer we will switch to normal SGD
             input_shape: A shape (batch, channels, height, width) the model will be trained with
             divide_in: An integer indicating how many tiles the feature map will be divided in
             cuda: Optional argument (default is False), set to True if using cuda
             verbose: Optional argument, enable logging
         """
-        self._input_size = input_shape
-        self._layers = layers
-        self._stop_index = stop_index
+        self.model = model
+
+        self._input_size = IOShape(*input_shape)
         self._divide_in = divide_in
         self._cuda = cuda
         self._verbose = verbose
+
+        # placeholder properties for batch training
         self._batch = False
+        self._batch_count = 0
 
-        if self._verbose:
-            print("Calculating patch boxes...")
+        # placeholder for first / last streaming layers
+        self._stream_to_layer = stream_to_layer
+        self._first_layer = self._get_layers()[0][0]
 
-        # Calculate overlap / pixels lost per layer
+        self._tree, self._reverse_tree = self._create_sequential_tree(input_shape)
+
+        # placeholder attributes for backprop
+        self._layer_outputs = {}
+        self._layer_inputs = {}
+        self._current_tile = None
+        self._current_fmap_tile = None
+        self._filled = {}
+        self._layer_should_detach = False
+        self._saved_gradients = {}
+        self._gradients = {}
+        self._outputs = {}
+
+        # Add hooks for the backwards pass
         #
-        self._full_output_lost = self._getreconstructioninformation(self._layers[:self._stop_index],
-                                                                    input_shape=(1, input_shape[2], input_shape[0], input_shape[1]))
-
-        # We keep track of the gradient sizes to check if we reconstruct all of it
-        #
-        self._gradient_sizes = self._calculate_gradient_sizes(self._full_output_lost, self._input_size, self._stop_index)
+        self._add_hooks_sequential()
 
         # Precalculate the coordinates of the tiles in the forward pass
         #
-        self._forward_patches_c, self._output_size, self._map_coords = self._forward_patches_coords()
+        self._forward_tiles, self._map_coords = self._calculate_tile_boxes()
 
         # Precalculate the coordinates of the tiles in the backward pass
         #
-        self._back_patches, self._grad_map_coords, self._patch_output_lost = self._backward_patches_coords()
-        # print(self._back_patches)
+        self._back_tiles, self._grad_map_coords = self._calculate_tile_boxes(backwards=True)
 
         if self._verbose:
-            print("Patch size forward:", (self._forward_patches_c[0][1][1], self._forward_patches_c[0][1][3]), "\n")
-            print("Calculating gradient. Embedding size:", self._gradient_sizes[-1])
-            print("Done. \nBackward patch size (for forward pass):", (self._back_patches[0][1][1], self._back_patches[0][1][3]))
+            print("Tile size forward:", (self._forward_tiles[0].height, self._forward_tiles[0].width))
+            print("Tile size backward (for forward pass):", (self._back_tiles[0].height, self._back_tiles[0].width))
 
             # These memory reduction calculations are incorrect
             # We should also think about channels
             #
-            # print("*** Memory reduction of patches: {:2.1f}% ***".format(100 - self._back_patches[0][1][1]**2 / self._input_size[1]**2 * 100))
-            # print("*** Memory reduction of embedding: {:2.1f}% ***".format(
-            #    100 - (self._output_size[1]**2 * self._output_size[0]) / (self._input_size[1]**2 * self._input_size[2]) * 100))
+            print("*** Approximate memory reduction of streaming: {:2.1f}% ***".format(
+                100 - self._back_tiles[0].height**2 / self._input_size.height**2 * 100))
 
     def forward(self, image):
         """Doing the forward pass
@@ -105,948 +365,465 @@ class StreamingSGD(object):
         if self._verbose:
             print("Doing backward pass...")
 
-        grad_embedding = torch.autograd.grad(loss, feature_map, only_inputs=False)[0]
+        loss.backward()
+        grad_embedding = feature_map.grad
 
-        relevant_grads, full_gradients = self._backward_patches(image[None], grad_embedding, fill_gradients)
+        self._gradients = {}
+        full_gradients = self._backward_tiles(image[None], grad_embedding, fill_gradients)
         return full_gradients
 
-    def _valid_grads_with_input(self, output_lost, start_index, sides=(0, 0, 0, 0)):
+    def _calculate_tile_boxes(self, backwards=False):
         """
-        This function gives 'crop' boxes for the gradients indicating which parts are valid gradients
-        (meaning would be the same as in the full image)
-        """
-        valid_boxes = []
-        v_x = 0
-        v_y = 0
-        v_w = 0
-        v_h = 0
-
-        p_x = 0
-        p_y = 0
-        p_w = 0
-        p_h = 0
-
-        prev_down = output_lost[1][-1]
-
-        # Deal with padding
-        #
-        padding = self._patch_output_lost[3][self._stop_index - 1].int()
-        p_x = padding[0]
-        p_w = padding[2]
-        p_y = padding[1]
-        p_h = padding[3]
-
-        if sides[0]:  # left
-            p_x = 0
-            p_w = padding[0] + padding[2]
-        if sides[1]:  # top
-            p_y = 0
-            p_h = padding[1] + padding[3]
-        if sides[2]:  # right
-            p_x = padding[0]
-            p_w = 0
-        if sides[3]:  # bottom
-            p_y = padding[1]
-            p_h = 0
-
-        valid_boxes.append((p_y, p_h, p_x, p_w))
-
-        for i in range(len(output_lost[0]) - 1):
-            grad_padding = output_lost[3][-(i + 1)].clone()
-            grad_lost = output_lost[0][-(i + 1)].clone()
-
-            grad_lost = (grad_lost * 2)
-            grad_down = output_lost[1][-(i + 2)]
-
-            factor = prev_down / grad_down
-
-            grad_lost[0:2] /= grad_down
-            grad_lost[2:] /= grad_down
-
-            # grad_padding[0:2] /= factor
-            # grad_padding[2:] /= factor
-
-            v_x *= factor[0]
-            v_w *= factor[0]
-            v_y *= factor[1]
-            v_h *= factor[1]
-
-            v_x += grad_lost[0]
-            v_w += grad_lost[1]
-            v_y += grad_lost[2]
-            v_h += grad_lost[3]
-
-            p_x = grad_padding[0]
-            p_w = grad_padding[2]
-            p_y = grad_padding[1]
-            p_h = grad_padding[3]
-
-            if sides[0] == 1:
-                v_x = 0
-                p_x = 0
-                p_w = grad_padding[2]
-            if sides[1] == 1:
-                v_y = 0
-                p_y = 0
-                p_h = grad_padding[3]
-            if sides[2] == 1:
-                v_w = 0
-                p_x = grad_padding[0]
-                p_w = 0
-            if sides[3] == 1:
-                v_h = 0
-                p_y = grad_padding[1]
-                p_h = 0
-
-            prev_down = grad_down
-            valid_boxes.append((int(v_y + p_y), int(v_h + p_h), int(v_x + p_x), int(v_w + p_w)))
-        # print(valid_boxes)
-
-        return valid_boxes
-
-    def _valid_gradients(self, patch, patch_embedding_grad, stop_index, output_lost, sides):
-        """
-        This function performs the backward pass (and the partial forward pass to
-        reconstruct the intermediate activations) and crops the gradients.
-        """
-
-        # Do partial forward pass and backward pass
-        #
-        patch_output = self.model.forward(patch, stop_index=stop_index, detach=True)
-        self.model.backward(gradient=patch_embedding_grad)
-        patch_gradients = [gradient for gradient in self.model.gradients]
-
-        # Calculate cropbox for gradients
-        #
-        valid_gradients_loss = self._valid_grads_with_input(output_lost, stop_index, sides=sides)
-
-        # Fetch the outputs of the patches
-        #
-        patch_outputs = [output for output in self.model.output]
-
-        # List with the cropped gradients
-        #
-        correct = []
-        # print(sides, valid_gradients_loss)
-        for index in range(len(patch_gradients)):
-            if index == 0:
-                # grad_padding = output_lost[3][-1]
-
-                # p_x = grad_padding[0]
-                # p_w = grad_padding[2]
-                # p_y = grad_padding[1]
-                # p_h = grad_padding[3]
-
-                # if sides[0] == 1:
-                #     p_x = 0
-                #     p_w = grad_padding[2]
-                # if sides[1] == 1:
-                #     p_y = 0
-                #     p_h = grad_padding[3]
-                # if sides[2] == 1:
-                #     p_x = grad_padding[0]
-                #     p_w = 0
-                # if sides[3] == 1:
-                #     p_y = grad_padding[1]
-                #     p_h = 0
-
-                # g_lost = [int(p_y), int(p_h), int(p_x), int(p_w)]
-
-                g_lost = [0, 0, 0, 0]
-
-            # else:
-                # Fetch gradient 'lost' in this layer
-                #
-
-            g_lost = valid_gradients_loss[index]
-
-            # Crop the gradient
-            #
-            p_grad = patch_gradients[index]
-            # print(index, p_grad.shape, g_lost)
-            p_grad = p_grad[:, :,
-                            g_lost[0]:p_grad.shape[2] - g_lost[1],
-                            g_lost[2]:p_grad.shape[3] - g_lost[3]]
-
-            # Crop the output
-            #
-            patch_output = patch_outputs[-(index + 1)]
-            patch_outputs[-(index + 1)] = patch_output[:, :,
-                                                       g_lost[0]:patch_output.shape[2] - g_lost[1],
-                                                       g_lost[2]:patch_output.shape[3] - g_lost[3]]
-
-            # print("new shape:", p_grad.shape)
-            correct.append(p_grad)
-
-        return correct, patch_outputs, valid_gradients_loss
-
-    def _forward_patches_coords(self):
-        """
-        This function calculates the coordinates of the patches / tiles needed
+        This function calculates the coordinates of the tiles needed
         for the forward pass to reconstruct the feature map
         """
+        last_layer_stats = self._tree[self._stream_to_layer]
+        first_layer_stats = self._tree[self._first_layer]
 
-        # Sum the padding / output lost over the whole streaming part of the network
-        #
-        lost = torch.stack(self._full_output_lost[0])[0:self._stop_index].sum(dim=0).int()
-        padding = torch.stack(self._full_output_lost[2])[0:self._stop_index].sum(dim=0).int()
+        output_shape = last_layer_stats.output_shape
+        downsampling = last_layer_stats.total_downsampling
 
-        # Fetch the last downsampling
-        #
-        down = self._full_output_lost[1][self._stop_index - 1].int()
+        output_tile_shape = IOShape(batch=0, channels=0,
+                                    height=output_shape.height // self._divide_in,
+                                    width=output_shape.width // self._divide_in)
 
-        # With the lost + down it is possible to calculate the output_size
-        # (= size of feature map to be reconstructed)
-        # TODO: _getreconstructioninformation knows this info, no need to recalculate
+        tile_shape = last_layer_stats.calculate_valid_input_shape(output_tile_shape, gradient_lost=backwards)
+
+        map_tile_shape, output_lost, grad_output_lost = \
+            first_layer_stats.calculate_output_shape(tile_shape, output_layer=last_layer_stats)
+
+        # To be sure that output_lost is the same everywhere we should do a normal calculate input shape:
         #
-        output_size = ((self._input_size[0] - lost[0] - lost[1] + padding[0] * 2) // down[0],
-                       (self._input_size[1] - lost[2] - lost[3] + padding[1] * 2) // down[1])
+        if backwards:
+            print('back', tile_shape, map_tile_shape)
+
+            new_tile_shape = last_layer_stats.calculate_input_shape(map_tile_shape)
+
+            map_tile_shape, output_lost, grad_output_lost = \
+                first_layer_stats.calculate_output_shape(new_tile_shape, output_layer=last_layer_stats)
+
+            # If the new input shape results in a smaller output than we want, do the calculation again
+            # with a bigger output shape.
+            #
+            if new_tile_shape.height < tile_shape.height or new_tile_shape.width < tile_shape.width:
+                map_tile_shape = IOShape(0, 0, map_tile_shape.height + 1, map_tile_shape.width + 1)
+                tile_shape = last_layer_stats.calculate_input_shape(map_tile_shape)
+
+                map_tile_shape, output_lost, grad_output_lost = \
+                    first_layer_stats.calculate_output_shape(tile_shape, output_layer=last_layer_stats)
+            else:
+                tile_shape = new_tile_shape
+
+            print("new", tile_shape, map_tile_shape)
+
+        # The tiles should have the same output_lost, but still check
+        #
+        self._compare_output_lost(output_lost)
 
         # The size of the patch/tile is feature map / divide_in
         #
-        patch_size = (output_size[0] // self._divide_in, output_size[1] // self._divide_in)
-        if output_size[0] % self._divide_in > 0 or output_size[1] % self._divide_in > 0:
-            print("Check size of tiles:!", output_size[0], "px , division asked not possible:", self._divide_in)
+        if output_shape.width % self._divide_in > 0 or output_shape.height % self._divide_in > 0:
+            print("Check size of tiles:!", output_shape, " division asked not possible:", self._divide_in)
 
-        if self._verbose:
-            print("Embedding divided in tile sizes:", patch_size, "\n")
+        if self._verbose and not backwards:
+            print("Feature map to be reconstructed shape:", (output_shape.width, output_shape.height))
+            print("Feature map divided in tile sizes:", (map_tile_shape.width, map_tile_shape.height))
 
-        padding = self._full_output_lost[3][self._stop_index - 1].int()
+        tile_boxes = []
+        embed_boxes = []
+        for y in range(0, int(output_shape.height), int(output_tile_shape.height)):
+            for x in range(0, int(output_shape.width), int(output_tile_shape.width)):
+                map_x = max(x - last_layer_stats.total_padding.left, 0)
+                map_y = max(y - last_layer_stats.total_padding.top, 0)
 
-        # new_output_lost = self._getreconstructioninformation(self.model.layers[:self._stop_index],
-        #                                                      input_shape=(1, self._input_size[2],
-        #                                                                   int(patch_size[1] + padding[1] + padding[3]),
-        #                                                                   int(patch_size[0] + padding[0] + padding[2])),
-        #                                                      stop_index=self._stop_index)
-        # set_trace()
+                tile_y, _, tile_x = first_layer_stats.output_to_input_coords(
+                    y=map_y, x=map_x, output_layer=last_layer_stats)[0:3]
 
-        # if not (torch.stack(self._full_output_lost[0])[:self._stop_index] ==
-        #         torch.stack(new_output_lost[0])).all():
+                sides = Sides(left=(x == 0), top=(y == 0),
+                              right=(tile_x + tile_shape.width >= self._input_size.width),
+                              bottom=(tile_y + tile_shape.height >= self._input_size.height))
 
-        #     print("!!!! Output lost error!")
+                map_height = map_tile_shape.height
+                map_width = map_tile_shape.width
 
-        #     for li, l in enumerate(new_output_lost[0]):
-        #         print("tile:", l.tolist(), "img:",  self._full_output_lost[0][li].tolist())
+                tile_height = tile_shape.height
+                tile_width = tile_shape.width
 
-        embedding_coords = []
-        boxes = []
-        for y in range(0, output_size[1], patch_size[1]):
-            for x in range(0, output_size[0], patch_size[0]):
-                # Calculate which part of the full image we need for this part of the feature map
-                # and take padding into account
+                check_output_lost = False
+
+                # Adjust for bottom and right edge and make sure the tile coordinates are
+                # multiples of total downsampling in network.
                 #
-                padding = self._full_output_lost[3][self._stop_index - 1].int()
-                p_x = max(x - padding[0], 0)
-                p_y = max(y - padding[1], 0)
+                if sides.bottom:
+                    tile_y = self._input_size.height - tile_height
+                    map_y = output_shape.height - map_height
 
-                p_w = patch_size[0]
-                p_h = patch_size[1]
+                    if tile_y % float(downsampling[0]) > 0:
+                        map_y = math.floor(tile_y / downsampling[0])
+                        check_output_lost = True
 
-                # set_trace()
-                box = self._input_box_for_output((p_x, p_y, p_w, p_h), self._full_output_lost, self._stop_index)
+                if sides.right:
+                    tile_x = self._input_size.width - tile_width
+                    map_x = output_shape.width - map_width
 
-                # TODO: CHECK THIS!
-                box = (box[0], box[1] + padding[2], box[2], box[3] + padding[3])
+                    if tile_x % float(downsampling[1]) > 0:
+                        map_x = math.floor(tile_x / downsampling[1])
+                        check_output_lost = True
 
-                # Keep track if we are at the sides (because we shouldn't crop the output here)
+                # If we changed x or y coordinate of tile, and size of tile,
+                # we should check what happens to output lost (i.e. output shape)
                 #
-                sides = [0, 0, 0, 0]  # left - top - right - bottom
-                sides[0] = 1 if x == 0 else 0
-                sides[2] = 1 if x + patch_size[0] >= output_size[0] else 0
-                sides[1] = 1 if y == 0 else 0
-                sides[3] = 1 if y + patch_size[1] >= output_size[1] else 0
+                if check_output_lost:
+                    tile_y, _, tile_x = first_layer_stats.output_to_input_coords(
+                        y=map_y, x=map_x, output_layer=last_layer_stats)[0:3]
 
-                embedding_coords.append((y, int(y + patch_size[1]), x, int(x + patch_size[0])))
-                boxes.append((sides, box))
+                    tile_width = self._input_size.width - tile_x
+                    tile_height = self._input_size.height - tile_y
 
-        return boxes, output_size, embedding_coords
+                    new_tile_shape = IOShape(0, 0, tile_height, tile_width)
+                    new_shape, output_lost, _ = \
+                        first_layer_stats.calculate_output_shape(new_tile_shape, output_layer=last_layer_stats)
 
-    def _output_box_for_input(self, input_coords, output_lost, stop_index):
-        """
-        This function calculates the coordinates of the feature map for a given input box
-        """
-        lost = torch.stack(output_lost[0])[0:stop_index].sum(dim=0).int()
-        down = output_lost[1][stop_index - 1].int()
-        padding = self._full_output_lost[3][self._stop_index - 1].int()
+                    self._compare_output_lost(output_lost)
 
-        # We always need a multiple of downsampling, otherwise downsampling layers
-        # will not begin in the correct corner for example with down = 2,
-        # we will want index 0 or index 2 of an image, index 1 will give wrong results
-        #
-        p_x = input_coords[0] / down[0]
-        p_y = input_coords[1] / down[1]
-        p_w = math.ceil((input_coords[2] - lost[0] - lost[1]) / down[0]) + padding[0] + padding[2]
-        p_h = math.ceil((input_coords[3] - lost[3] - lost[2]) / down[1]) + padding[1] + padding[3]
+                    map_height = new_shape.height
+                    map_width = new_shape.width
 
-        # top bottom left right
-        return (int(p_y), int(p_y + p_h), int(p_x), int(p_x + p_w))
+                    if map_x + map_width != output_shape.width or map_y + map_height != output_shape.height:
+                        print("Warning: the reconstructed feature map size is slightly "
+                              "bigger or smaller than the feature map of the whole image."
+                              "This can cause small differences in gradients.")
 
-    def _input_box_for_output(self, output_coords, output_lost, stop_index):
-        """
-        This function calculates the coordinates of the input for a given feature map box
-        """
-        lost = torch.stack(output_lost[0])[0:stop_index].sum(dim=0).int()
-        down = output_lost[1][stop_index - 1].int()
-        padding = self._full_output_lost[3][self._stop_index - 1].int()
+                tile_box = Box(tile_y, tile_height, tile_x, tile_width, sides)
+                embed_box = Box(map_y, map_height, map_x, map_width, sides)
 
-        p_x = output_coords[0] * down[0]
-        p_y = output_coords[1] * down[1]
-        p_w = (output_coords[2]) * down[0] + lost[0] + lost[1]
-        p_h = (output_coords[3]) * down[1] + lost[2] + lost[3]
+                # Filter out duplicates
+                #
+                exists = False
+                for e_b in embed_boxes:
+                    if e_b.x == embed_box.x and e_b.y == embed_box.y:
+                        exists = True
+                if exists:
+                    continue
 
-        return (p_y, p_y + p_h, p_x, p_x + p_w)  # top bottom left right
+                tile_boxes.append(tile_box)
+                embed_boxes.append(embed_box)
+
+        return tile_boxes, embed_boxes
+
+    def _compare_output_lost(self, output_lost):
+        next_layer = self._tree[self._first_layer]
+        difference = False
+        for i in range(len(output_lost)):
+            if next_layer.output_lost != output_lost[i]:
+                print("Output lost difference!", next_layer.name, next_layer.output_lost, output_lost[i])
+                difference = True
+                break
+            next_layer = next_layer.next
+        return difference
 
     def _forward_patches(self, image):
         """
         This function performs the streaming forward pass followed by
         the normal pass through the end of the network.
         """
-        feature_map = None
         if self._verbose:
-            iterator = tqdm(enumerate(self._forward_patches_c), total=len(self._forward_patches_c))
+            iterator = tqdm(enumerate(self._forward_tiles), total=len(self._forward_tiles))
         else:
-            iterator = enumerate(self._forward_patches_c)
+            iterator = enumerate(self._forward_tiles)
 
-        # Reconstruct the feature map patch by patch
+        # Create (to be reconstructed) feature_map placeholder variable
         #
-        for i, patch in iterator:
-            coords = patch[1]
-            sides = patch[0]
-            map_c = self._map_coords[i]
+        output_size = self._tree[self._stream_to_layer].output_shape
+        feature_map = torch.zeros(1, int(output_size.channels), int(output_size.height), int(output_size.width),
+                                  dtype=torch.float)
 
-            # Fetch the relevant part of the full image
-            #
-            data = image[:, :, coords[0]:coords[1], coords[2]:coords[3]].clone()  # not sure if we need clone here?
-            data.volatile = True
-            if self._cuda:
-                data = data.cuda()
+        if image.dtype == torch.double:
+            feature_map = feature_map.double()
 
-            # Do the actual forward pass
-            #
-            patch_output = self.model.forward(data, self._stop_index, detach=False)
+        # Reconstruct the feature map tile by tile
+        #
+        with torch.no_grad():
+            for i, tile in iterator:
+                map_c = self._map_coords[i]
 
-            # Deal with padding
-            #
-            padding = self._patch_output_lost[3][self._stop_index - 1].int()
-            p_x = padding[0]
-            p_w = padding[2]
-            p_y = padding[1]
-            p_h = padding[3]
-
-            if sides[0]:  # left
-                p_x = 0
-                p_w = padding[0] + padding[2]
-            if sides[1]:  # top
-                p_y = 0
-                p_h = padding[1] + padding[3]
-            if sides[2]:  # right
-                p_x = padding[0]
-                p_w = 0
-            if sides[3]:  # bottom
-                p_y = padding[1]
-                p_h = 0
-
-            patch_output = patch_output[:, :,
-                                        p_y:patch_output.shape[2] - p_h,
-                                        p_x:patch_output.shape[3] - p_w]
-
-            c = patch_output.shape[1]
-
-            # Create (to be reconstructed) feature_map placeholder variable if it doesn't exists yet
-            #
-            if feature_map is None:
-                feature_map = torch.autograd.Variable(torch.FloatTensor(1, c,
-                                                                        int(self._output_size[1]),
-                                                                        int(self._output_size[0])))
-                if isinstance(data.data, torch.DoubleTensor):
-                    feature_map = feature_map.double()
+                # Fetch the relevant part of the full image
+                #
+                data = image[:, :,
+                             int(tile.y):int(tile.y + tile.height),
+                             int(tile.x):int(tile.x + tile.width)].clone()  # not sure if we need clone here?
 
                 if self._cuda:
-                    feature_map = feature_map.cuda()
+                    data = data.cuda()
 
-            # Save the output of the network in the relevant part of the feature_map
-            #
-            feature_map[:, :, map_c[0]:map_c[1], map_c[2]:map_c[3]] = patch_output
-            patch_output = None  # trying memory management
+                # Do the actual forward pass
+                #
+                self._layer_should_detach = False
+                output = self.model.forward(data, self._stream_to_layer)
+                tile_output, tile_lost = self._tree[self._stream_to_layer].trim_to_valid_output(output, tile)
+
+                valid_map_c = Box(map_c.y + tile_lost.top, map_c.height - tile_lost.bottom - tile_lost.top,
+                                  map_c.x + tile_lost.left, map_c.width - tile_lost.right - tile_lost.left, None)
+
+                # Save the output of the network in the relevant part of the feature_map
+                #
+                feature_map[:, :,
+                            int(valid_map_c.y):int(valid_map_c.y + valid_map_c.height),
+                            int(valid_map_c.x):int(valid_map_c.x + valid_map_c.width)] = tile_output
+
+                tile_output = None  # trying memory management
+                output = None
+
+        if self._cuda:
+            feature_map = feature_map.cuda()
 
         # From the feature map on we have to be able to generate gradients again
         #
-        feature_map.volatile = False
-        feature_map.requires_grad = True
+        feature_map.requires_grad_()
 
         # Run reconstructed feature map through the end of the network
         #
-        final_output = self.model.forward(feature_map, start_index=self._stop_index)
+        final_output = self.model.forward(feature_map, start_at_layer=self._stream_to_layer)
 
         return final_output, feature_map
 
-    def _calculate_gradient_sizes(self, output_lost, input_size, stop_index):
-        """
-        This utility function calculates the size of the gradients per layer
-        (basically equals output size)
-        """
-        sizes = []
-        size = input_size
-        prev_down = torch.FloatTensor([1., 1.])
-        for i in range(stop_index):
-            down = output_lost[1][i] / prev_down
-            padding = output_lost[2][i].clone()
-            lost = (output_lost[0][i]).clone()
-            padding /= output_lost[1][i]
-            lost[0:2] /= output_lost[1][i]
-            lost[2:] /= output_lost[1][i]
-            size = ((size[0] - lost[0] - lost[1] + padding[0] * 2) // down[0],
-                    (size[1] - lost[2] - lost[3] + padding[1] * 2) // down[1])
-            sizes.append(size)
-            prev_down = output_lost[1][i]
-
-        return sizes
-
-    def _relevant_gradients(self, gradients, targed_map_coords, grad_crop_box, outputs, filled_grad_coords, fill_gradients=False, full_gradients=None):
-        """
-        Gradients should be in order of network layers
-        We assume patches are backpropped from left to right, top to bottom
-
-        In this function we keep track of which parts of the gradients of inputs to each layer we
-        already reconstructed. It will only remember the 'relevant' part of the gradient per patch.
-        We need this functions because there can be significant overlap in the gradients in some layers.
-        """
-
-        # filled_grad_coords is the array that keeps track of which gradients are filled
+    @staticmethod
+    def fill_tensor(data, data_loc: Box, tensor_shape: IOShape, already_filled: Box):
+        # This functions return which parts (could also be used for output in forward pass!)
+        # Check if this is a new row
         #
-        if filled_grad_coords is None:
-            filled_grad_coords = torch.FloatTensor(len(gradients), 3).fill_(0)  # y, x, height
+        rel_top = 0  # 0
+        rel_bottom = 0  # 1
+        rel_left = 0  # 2
+        rel_right = 0  # 3
 
-        # If we want to remember the reconstructed input gradient create the placeholder list
+        already_filled_y = already_filled.y
+        already_filled_x = already_filled.x
+        already_filled_height = already_filled.height
+
+        # check if new row
+        if data_loc.x == 0:
+            already_filled_y = already_filled_height
+            already_filled_height = data_loc[0] + data.shape[2]
+            already_filled_x = 0
+
+        # Check x (column):
         #
-        if fill_gradients is True:
-            if full_gradients is None:
-                full_gradients = []
-
-        # List with the final reconstructed input gradients (for this patch)
+        # If this gradient is exactly on the border we can use everything in x-axis
         #
-        rel_gradients = []
+        if data_loc.x == already_filled_x:
+            rel_left = 0
+            rel_right = data.shape[3]
 
-        # To calculate where we currently are in the input gradient, we need to keep track of the downsampling
+        # If this gradient has some overlap with our current location check if we should use it
         #
-        prev_down = self._patch_output_lost[1][-1]
+        elif data_loc.x + tensor_shape.width > already_filled_x:
+            if already_filled_x - data_loc.x < 0:
+                print("Misses gradient in x-direction! Will probably crash...")
+                print("We should be at:", already_filled_x, "but are at:", data_loc.x)
+                print("Gradient size:", tensor_shape.width)
+            rel_left = already_filled_x - data_loc.x
+            rel_right = data.shape[3]
 
-        # Current coordinate of the input gradient of the reconstructed feature map
+        # Check y (row):
         #
-        c_coord = torch.FloatTensor(targed_map_coords[0:2])
-
-        new_row = False
-        for i, gradient in enumerate(gradients):
-            # Current gradient locations
-            #
-            c_gradient_coords = filled_grad_coords[i]
-            c_gradient_size = self._gradient_sizes[-(i + 1)]
-
-            if i == 0:
-                # We do not lose gradients in the first layer, since they come from the reconstructed feature map.
-                c_gradient_lost = torch.FloatTensor([0, 0, 0, 0])
-                c_padding = torch.FloatTensor([0, 0, 0, 0])
-            else:
-                # left right top bottom
-                c_gradient_lost = self._patch_output_lost[0][-(i)] * 2
-                c_padding = self._patch_output_lost[3][-(i)]
-
-            # Calculate how much of the input is lost in the conv operation of this layer
-            #
-            c_gradient_down = prev_down / self._patch_output_lost[1][-(i + 1)]
-            c_gradient_lost[0:2] /= self._patch_output_lost[1][-(i + 1)]
-            c_gradient_lost[2:] /= self._patch_output_lost[1][-(i + 1)]
-
-            prev_down = self._patch_output_lost[1][-(i + 1)]
-
-            # Calculate current coords
-            #
-            c_coord *= c_gradient_down
-            # if c_gradient_coords[1] > 0 and i == 0:
-            #    set_trace()
-
-            # If we already were at the border, the new gradient location is also there
-            #
-            if c_coord[0] <= 0:
-                c_coord[0] = 0
-            else:
-                # otherwise we need to offset for input lost
-                #
-                c_coord[0] += c_gradient_lost[2] + c_padding[1]
-
-            # Same holds for x-axes
-            if c_coord[1] <= 0:
-                c_coord[1] = 0
-            else:
-                c_coord[1] += c_gradient_lost[0] + c_padding[0]
-
-            # if i == 0:
-            # set_trace()
-            # print(i, c_coord.tolist(), c_padding.tolist(), c_gradient_coords.tolist())
-
-            # if i == 1:
-            # print(c_padding.tolist(), c_coord.tolist(), c_gradient_size)
-
-            # Calculate relevant gradient coords
-            #
-            rel_coords = [0, 0, 0, 0]  # y, h+y, x, w+x
-
-            # Check if this is a new row
-            #
-            if c_coord[1] == 0:
-                if i == 0:
-                    new_row = True
-                # Don't reset X - row if not needed
-                #
-                if new_row:
-                    if c_coord[0] + gradient.shape[2] > c_gradient_coords[2]:
-                        c_gradient_coords[0] = c_gradient_coords[2]
-                        c_gradient_coords[2] = c_coord[0] + gradient.shape[2]
-                        c_gradient_coords[1] = 0
-
-            #####################
-            # Check x (column): #
-            #####################
-            #
-            # If this gradient is exactly on the border we can use everything in x-axis
-            #
-            if c_coord[1] == c_gradient_coords[1]:
-                rel_coords[2] = 0
-                rel_coords[3] = gradient.shape[3]
-
-            # If this gradient has some overlap with our current location check if we should use it
-            #
-            elif c_coord[1] + gradient.shape[3] > c_gradient_coords[1]:
-                if c_gradient_coords[1] - c_coord[1] < 0:
-                    print("gradient i:", i, "misses gradient in x-direction! Will probably crash...")
-                    print("We should be at:", c_gradient_coords[1], "but are at:", c_coord[1])
-                    print("Gradient size:", gradient.shape)
-                    continue
-                rel_coords[2] = c_gradient_coords[1] - c_coord[1]
-                rel_coords[3] = gradient.shape[3]
-
-            ##################
-            # Check y (row): #
-            ##################
-            #
-            # If this gradient is exactly on the border we can use everything in y-axis
-            #
-            if c_coord[0] == c_gradient_coords[0]:
-                rel_coords[0] = 0
-                rel_coords[1] = gradient.shape[2]
-
-            # If this gradient has some overlap with our current location check if we should use it
-            #
-            elif c_coord[0] + gradient.shape[2]:
-                if c_gradient_coords[0] - c_coord[0] < 0:
-                    print("We miss pieces of gradient in y-direction! Continuing...")
-                    print("We should be at:", c_gradient_coords[0], "but are at:", c_coord[0])
-                    continue
-                rel_coords[0] = c_gradient_coords[0] - c_coord[0]
-                rel_coords[1] = gradient.shape[2]
-
-                # Check the bottom y-coord (if on the bottom we need to adjust)
-                #
-                if c_gradient_coords[0] + (gradient.shape[2] - rel_coords[0]) > c_gradient_size[1]:
-                    rel_coords[0] += (c_gradient_coords[0] + (gradient.shape[2] - rel_coords[0])) \
-                        - c_gradient_size[1]
-
-            # Set new gradient location
-            #
-            c_gradient_coords[1] += (rel_coords[3] - rel_coords[2])
-
-            # Check the right x-coord (if on the right edge we need to adjust)
-            #
-            if c_gradient_coords[1] > c_gradient_size[0]:
-                rel_coords[2] += (c_gradient_coords[1] - c_gradient_size[0])
-                c_gradient_coords[1] -= (c_gradient_coords[1] - c_gradient_size[0])
-
-            rel_coords = [int(coord) for coord in rel_coords]
-
-            if rel_coords[0] < 0:
-                print("We miss gradients in y-axis before:", c_coord)
-            if rel_coords[2] < 0:
-                print("We miss gradients in x-axis before:", c_coord)
-
-            # Clone the right gradients and save the corresponding output
-            #
-            if rel_coords[1] - rel_coords[0] == 0:
-                continue
-            if rel_coords[3] - rel_coords[2] == 0:
-                continue
-
-            rel_gradient = gradient[:, :, rel_coords[0]:rel_coords[1], rel_coords[2]:rel_coords[3]]
-            rel_output = outputs[-(i + 1)][:, :, rel_coords[0]:rel_coords[1], rel_coords[2]:rel_coords[3]]
-
-            ###################
-            if c_coord[0] > 0:
-                c_coord[0] -= c_padding[1]
-
-            # Same holds for x-axes
-            if c_coord[1] > 0:
-                c_coord[1] -= c_padding[0]
-            ####################
-            # If we want to return the reconstructed input gradients to each layer, save them here
-            #
-            if fill_gradients:
-                if i == len(full_gradients):
-                    full_gradients.append(
-                        torch.autograd.Variable(
-                            torch.FloatTensor(1, rel_gradient.shape[1],
-                                              int(self._gradient_sizes[-(i + 1)][0]),
-                                              int(self._gradient_sizes[-(i + 1)][1]))))
-
-                    full_gradients[i].fill_(0)
-
-                # Check if in this part of the gradient we didn't already put values
-                #
-                #if np.count_nonzero(full_gradients[i - 1][:, :,
-                #                                          int(c_gradient_coords[0]):
-                #                                          int(c_gradient_coords[2]),
-                #                                          int(c_gradient_coords[1] - rel_gradient.shape[3]):
-                #                                          int(c_gradient_coords[1])]) > 0:
-                #    print("Overwriting!")
-
-                full_gradients[i][:, :,
-                                  int(c_gradient_coords[0]):
-                                  int(c_gradient_coords[2]),
-                                  int(c_gradient_coords[1] - rel_gradient.shape[3]):
-                                  int(c_gradient_coords[1])] = rel_gradient.clone()
-
-            rel_gradients.append((rel_gradient.clone(), rel_output))
-
-        if fill_gradients:
-            return rel_gradients, filled_grad_coords, full_gradients
-        else:
-            return rel_gradients, filled_grad_coords, None
-
-    def _backward_patches_coords(self):
-        """
-        This function calculates the coordinates of the patches / tiles needed
-        for the backward pass to reconstruct the relevant activations
-        """
-        # Calculate forward patch sizes for gradient checkpointing
+        # If this gradient is exactly on the border we can use everything in y-axis
         #
-        # NOTE: output lost * 2 is not always correct,
-        # if we loose pixels due to the kernel
-        # not fitting perfectly of the whole image we also multiply those.
-        # This propably results in bigger input patches than needed.
-        # Due to deadlines we leave it like this for now.
-        #
-        box_size = [int(math.ceil(self._output_size[0] / self._divide_in)),
-                    int(math.ceil(self._output_size[1] / self._divide_in))]
+        if data_loc.y == already_filled_y:
+            rel_top = 0
+            rel_bottom = data.shape[2]
 
-        # The first layer overlap
+        # If this gradient has some overlap with our current location check if we should use it
         #
-        first_lost = self._full_output_lost[0][0]
-        first_pad = self._full_output_lost[2][0]
+        elif data_loc.y + data.shape[2]:
+            if already_filled_y - data_loc[0] < 0:
+                print("We miss pieces of gradient in y-direction! Continuing...")
+                print("We should be at:", already_filled_y, "but are at:", data_loc.y)
+                return None
+            rel_top = already_filled_y - data_loc.y
+            rel_bottom = data.shape[2]
 
-        # This loop does the actual calculation,
-        # there is probably an easier approach than looping here.
-        #
-        size = torch.FloatTensor([box_size[0], box_size[1]])
-        padding = self._full_output_lost[3][-1].clone()
-        prev_down = self._full_output_lost[1][-1]
-        for i in range(len(self._full_output_lost[0]) - 1):
-            grad_lost = self._full_output_lost[0][-(i + 1)].clone()
-            padding = self._full_output_lost[2][-(i + 1)].clone()
-
-            # We lose twice the amount of valid gradient (see paper)
+            # Check the bottom y-coord (if on the bottom we need to adjust)
             #
-            grad_lost = (grad_lost * 2)
-            # padding = (padding * 2)
+            if already_filled_y + (data.shape[2] - rel_top) > tensor_shape.height:
+                rel_top += (already_filled_y + (data.shape[2] - rel_top)) \
+                    - tensor_shape.height
 
-            # Keep track of downsampling factor
-            #
-            grad_down = self._full_output_lost[1][-(i + 1)]
-
-            factor = prev_down / grad_down
-            size *= factor
-
-            grad_lost[0:2] /= grad_down
-            grad_lost[2:] /= grad_down
-            padding = padding / grad_down
-
-            # Sum the amount of gradient lost to the current size
-            #
-            size[0] += grad_lost[0] + grad_lost[1] + padding[1] * 2
-            size[1] += grad_lost[2] + grad_lost[3] + padding[0] * 2
-
-            prev_down = grad_down
-
-        # Since we do not need to reconstruct the gradient of the first layer
-        # we can use the normal overlap here
+        # Set new gradient location
         #
-        size[0] += first_lost[0] + first_lost[1]
-        size[1] += first_lost[2] + first_lost[3]
+        already_filled_x += (rel_right - rel_left)
 
-        # Here we check if the convolutions fit the same between the tiles and
-        # the full input image
+        # Check the right x-coord (if on the right edge we need to adjust)
         #
-        new_output_lost = self._getreconstructioninformation(self.model.layers[:self._stop_index],
-                                                             input_shape=(1, self._input_size[2], int(size[1]), int(size[0])),
-                                                             stop_index=self._stop_index)
+        if already_filled_x > tensor_shape.width:
+            rel_left += (already_filled_x - tensor_shape.width)
+            already_filled_x -= (already_filled_x - tensor_shape.width)
 
-        adjust_step = 0
-        if not (torch.stack(self._full_output_lost[0])[:self._stop_index] == torch.stack(new_output_lost[0])).all():
-            print("!!!! New patch size has different output overlap profile. This could cause problems",
-                  "with required patch sizes. Further testing needed.")
+        rel_top = int(rel_top)
+        rel_left = int(rel_left)
+        rel_bottom = int(rel_bottom)
+        rel_right = int(rel_right)
 
-            full_output_arr = self._full_output_lost[0][:self._stop_index]
-            patch_output_arr = new_output_lost[0]
-            diff_c = torch.nonzero(torch.stack(full_output_arr) != torch.stack(patch_output_arr))[0]
-            max_diff = 0
-            for c in diff_c:
-                diff = torch.max(patch_output_arr[c] - full_output_arr[c])
-                diff *= torch.max(torch.stack(self._full_output_lost[1])[c])
-                if diff > max_diff:
-                    max_diff = diff
+        if rel_top < 0:
+            print("We miss gradients in y-axis before:", data_loc)
+        if rel_left < 0:
+            print("We miss gradients in x-axis before:", data_loc)
 
-            print("!! We are losing", max_diff, "px information of the input image because of different amount of pixels lost.")
+        return Box(rel_top, rel_bottom - rel_top, rel_left, rel_right - rel_left, None), \
+            Box(already_filled_y, already_filled_height, already_filled_x, 0, None)
 
-            for li, l in enumerate(new_output_lost[0]):
-                print("tile:", l.tolist(), "img:",  self._full_output_lost[0][li].tolist())
-
-            # TODO: Test this better
-            # We need to add a certain margin because output lost can differ and
-            # thus we can miss edges of gradient
-            #
-            adjust_step = 1  # we should be able to calculate this, but for now assume 1 extra pixel for embedding
-
-        size = [int(s) for s in size]
-        lost = torch.stack(new_output_lost[0])[1:self._stop_index].sum(dim=0).int()
-        # padding = torch.stack(new_output_lost[2])[1:self._stop_index].sum(dim=0).int()
-
-        first_lost = new_output_lost[0][0]
-
-        patches = []
-        grad_embedding_coords = []
-        down = new_output_lost[1][self._stop_index - 1].int()
-        for y in range(0, self._output_size[1], box_size[1] - adjust_step):
-            for x in range(0, self._output_size[0], box_size[0] - adjust_step):
-                # Adjust the x and y with the total amount lost at the x and y
-                # This would be the coordinates of the tile
-                #
-                padding = self._full_output_lost[3][self._stop_index - 1].int()
-
-                p_x = x * down[0] - lost[0] - padding[0] - padding[2]
-                p_y = y * down[1] - lost[2] - padding[1] - padding[3]
-
-                p_x = (x - math.ceil(lost[0] / down[0]) - padding[0]) * down[0]
-                p_y = (y - math.ceil(lost[2] / down[1]) - padding[1]) * down[1]
-
-                p_w = size[0]
-                p_h = size[1]
-
-                # test_w = (math.ceil(lost[0] / down[0]) + padding[0]) * down[0]
-
-                # set_trace()
-                # if p_x + test_w == 0:
-                #     continue
-                # if p_y + test_w == 0:
-                #     continue
-
-                # We need to keep track which tiles are on the edge,
-                # since we shouldn't crop gradients there.
-                #
-                sides = [0, 0, 0, 0]  # left - top - right - bottom
-                if p_x <= 0:
-                    p_x = 0
-                    sides[0] = 1
-                if p_x + p_w >= self._input_size[0]:
-                    sides[2] = 1
-                    p_x = self._input_size[0] - p_w
-                if p_y <= 0:
-                    p_y = 0
-                    sides[1] = 1
-                if p_y + p_h >= self._input_size[1]:
-                    sides[3] = 1
-                    p_y = self._input_size[1] - p_h
-
-                # Calculate coordinates of the feature map of this tile
-                #
-                grad_embed = self._output_box_for_input((p_x, p_y, p_w, p_h), new_output_lost, self._stop_index)
-                grad_embedding_coords.append((grad_embed, (grad_embed[0], grad_embed[2])))
-
-                patches.append((sides, (p_y, p_y + p_h, p_x, p_x + p_w)))
-
-        return patches, grad_embedding_coords, new_output_lost
-
-    def _backward_patches(self, image, feature_map, fill_gradients=False):
+    def _backward_tiles(self, image, feature_map, fill_gradients=False):
         """
         This function is responsible for doing the backward pass per tile
         """
-        relevant_grads = []
-        filled_grad_coords = None
-        full_gradients = None
-
-        if self._batch:
-            self._save_batch_gradients()
-            self._zero_gradient()
+        # if self._batch:
+        #     self._save_batch_gradients()
+        #     self._zero_gradient()
 
         if self._verbose:
-            iterator = tqdm(enumerate(self._back_patches), total=len(self._back_patches))
+            iterator = tqdm(enumerate(self._back_tiles), total=len(self._back_tiles))
         else:
-            iterator = enumerate(self._back_patches)
+            iterator = enumerate(self._back_tiles)
 
-        for i, (sides, coords) in iterator:
-            self._save_gradients()
+        self._filled = {}
 
+        layerstats_last_layer = self._tree[self._stream_to_layer]
+        first_backward_layer = layerstats_last_layer.name
+        for i, tile in iterator:
+            self._layer_outputs = {}
+            self._layer_inputs = {}
             # Extract the tile
             #
-            # print("coords", coords)
-            patch = image[:, :, coords[0]:coords[1], coords[2]:coords[3]].clone()  # TODO: test if clone() here is needed
+            data = image[:, :,
+                         int(tile.y):int(tile.y + tile.height),
+                         int(tile.x):int(tile.x + tile.width)]
 
             if self._cuda:
-                patch = patch.cuda()
+                data = data.cuda()
 
             # Get the relevant part of the feature map for this tile
             #
-            map_c = self._grad_map_coords[i][0]
-            patch_map_grad = feature_map[:, :, map_c[0]:map_c[1], map_c[2]:map_c[3]].clone()  # TODO: test if clone() here is needed
+            map_c = self._grad_map_coords[i]
 
-            # Do the actual partial forward pass and backward pass of the tile
-            #
-            val_gradients, outputs, grads_crop_boxes = self._valid_gradients(patch,
-                                                                             patch_map_grad,
-                                                                             self._stop_index,
-                                                                             self._patch_output_lost,
-                                                                             sides)
+            tile_map_grad = feature_map[:, :,
+                                        int(map_c.y):int(map_c.y + map_c.height),
+                                        int(map_c.x):int(map_c.x + map_c.width)]
 
-            # The coordinates of the reconstructed gradients w.r.t. the original input gradients
-            #
-            current_grad_pos = self._grad_map_coords[i][1]
+            self._current_tile = tile
+            self._current_fmap_tile = map_c
 
-            # Extract the relevant parts of the gradients
+            # Do partial forward pass and backward pass
+            # Hooks will be used to fetch relevant gradients / outputs
             #
-            rel_grads, filled_grad_coords, full_gradients = self._relevant_gradients(val_gradients,
-                                                                                     current_grad_pos,
-                                                                                     grads_crop_boxes,
-                                                                                     outputs,
-                                                                                     filled_grad_coords,
-                                                                                     fill_gradients=fill_gradients,
-                                                                                     full_gradients=full_gradients)
-            self._restore_gradients()
-
-            # Redo backward pass with the relevant parts of the gradient
-            #
-            self._apply_gradients(rel_grads)
+            self._layer_should_detach = True
+            output = self.model.forward(data, stop_at_layer=self._stream_to_layer)
+            self._layer_outputs[self._stream_to_layer] = output
+            self._backward_sequential(first_backward_layer, tile_map_grad, fill_gradients)
 
             # Needed for memory control
             #
-            del rel_grads
-            del val_gradients
-            del outputs
-            del patch
-            del patch_map_grad
+            del data
+            del tile_map_grad
+            del self._layer_outputs
+            del self._layer_inputs
 
         if self._batch:
-            self._sum_batch_gradients()
+            # self._sum_batch_gradients()
             self._batch_count += 1
 
-        trimmed_full_gradient = []
-        if full_gradients and self._verbose:
-            for i, gradients in enumerate(full_gradients):
-                for j, gradient in enumerate(gradients):
-                    filled_shape = filled_grad_coords[i]
-                    gradient = gradient[:, 0:int(filled_shape[2]), 0:int(filled_shape[1])]
-                    trimmed_full_gradient.append(gradient)
-                    print("Filled gradient size", gradient.shape)
+        self._layer_should_detach = False
 
         if self._verbose:
-            print("\nFilled gradient sizes:")
-            print(filled_grad_coords, "\n")
+            print("Everything reconstructed:\n", self._check_gradient_size(self._filled))
 
-            print("Everything filled:\n", self._check_gradient_size(filled_grad_coords, self._gradient_sizes))
-
-        return relevant_grads, trimmed_full_gradient
+        if fill_gradients:
+            return self._gradients, self._outputs
+        else:
+            return (None, None)
 
     # --------------------------
     # Gradient utility functions
     #
-    def _zero_gradient(self):
-        """Zeros all the gradients of all the streaming Conv2d layers"""
-        for i, layer in enumerate(self.model.layers[:self._stop_index]):
-            if isinstance(layer, torch.nn.Conv2d):
-                if layer.weight.grad is not None:
-                    layer.weight.grad.data.zero_()
-                    layer.bias.grad.data.zero_()
+    # def _zero_gradient(self):
+    #     """Zeros all the gradients of all the streaming Conv2d layers"""
+    #     for key, layerstat in self._tree.items():
+    #         if isinstance(layerstat.layer, torch.nn.Conv2d):
+    #             if layerstat.layer.weight.grad is not None:
+    #                 layerstat.layer.weight.grad.data.zero_()
+    #                 layerstat.layer.bias.grad.data.zero_()
 
     def _save_gradients(self):
         """Save all the gradients of all the streaming Conv2d layers"""
-        self._saved_gradients = []
-        for i, layer in enumerate(self.model.layers[:self._stop_index]):
-            if isinstance(layer, torch.nn.Conv2d):
-                if layer.weight.grad is not None:
-                    self._saved_gradients.append((layer.weight.grad.data.clone(),
-                                                  layer.bias.grad.data.clone()))
+        for key, layerstat in self._tree.items():
+            if isinstance(layerstat.layer, torch.nn.Conv2d) and layerstat.streaming:
+                if layerstat.layer.weight.grad is not None:
+                    self._saved_gradients[key] = (layerstat.layer.weight.grad.data.clone(),
+                                                  layerstat.layer.bias.grad.data.clone())
 
-    def _save_batch_gradients(self):
-        """Save the valid batch gradients"""
-        self._saved_batch_gradients = []
-        for i, layer in enumerate(self.model.layers[:self._stop_index]):
-            if isinstance(layer, torch.nn.Conv2d):
-                if layer.weight.grad is not None:
-                    self._saved_batch_gradients.append((layer.weight.grad.data.clone(),
-                                                        layer.bias.grad.data.clone()))
+    # def _save_batch_gradients(self):
+    #     """Save the valid batch gradients"""
+    #     self._saved_batch_gradients = {}
+    #     for key, layerstat in self._tree.items():
+    #         if isinstance(layerstat.layer, torch.nn.Conv2d):
+    #             if layerstat.layer.weight.grad is not None:
+    #                 print(key)
+    #                 self._saved_batch_gradients[key] = (layerstat.layer.weight.grad.data.clone(),
+    #                                                     layerstat.layer.bias.grad.data.clone())
 
     def _restore_gradients(self):
         """Restore the saved valid Conv2d gradients"""
-        j = -1
-        for i, layer in enumerate(self.model.layers[:self._stop_index]):
-            if isinstance(layer, torch.nn.Conv2d):
-                j += 1
-                if layer.weight.grad is not None:
-                    layer.weight.grad.data.fill_(0)
-                    layer.bias.grad.data.fill_(0)
+        for key, layerstat in self._tree.items():
+            if isinstance(layerstat.layer, torch.nn.Conv2d) and layerstat.streaming:
+                if layerstat.layer.weight.grad is not None:
+                    layerstat.layer.weight.grad.data.fill_(0)
+                    layerstat.layer.bias.grad.data.fill_(0)
 
-                    if len(self._saved_gradients) > 0:
-                        gradient_tuple = self._saved_gradients[j]
+                    if key in self._saved_gradients:
+                        gradient_tuple = self._saved_gradients[key]
+                        layerstat.layer.weight.grad.data += gradient_tuple[0]
+                        layerstat.layer.bias.grad.data += gradient_tuple[1]
 
-                        layer.weight.grad.data += gradient_tuple[0]
-                        layer.bias.grad.data += gradient_tuple[1]
+    # def _sum_batch_gradients(self):
+    #     """Sum gradients within a batch"""
+    #     if not self._saved_batch_gradients:
+    #         return
 
-    def _sum_batch_gradients(self):
-        """Sum gradients within a batch"""
-        if len(self._saved_batch_gradients) == 0:
-            return
+    #     for key, layerstat in self._tree.items():
+    #         if isinstance(layerstat.layer, torch.nn.Conv2d):
+    #             if layerstat.layer.weight.grad is not None:
+    #                 if key in self._saved_batch_gradients:
+    #                     gradient_tuple = self._saved_batch_gradients[key]
+    #                     layerstat.layer.weight.grad.data += gradient_tuple[0]
+    #                     layerstat.layer.bias.grad.data += gradient_tuple[1]
 
-        j = -1
-        for i, layer in enumerate(self.model.layers[:self._stop_index]):
-            if isinstance(layer, torch.nn.Conv2d):
-                j += 1
-                if layer.weight.grad is not None:
-                    gradient_tuple = self._saved_batch_gradients[j]
-                    layer.weight.grad.data += gradient_tuple[0]
-                    layer.bias.grad.data += gradient_tuple[1]
-
-    def _apply_gradients(self, gradients):
+    def _apply_gradients(self, name, valid_grad):
         """Apply the relevant gradients"""
-        for i, (grad, out) in enumerate(gradients):
-            out.backward(grad)
+        self._tree[name].layer.backward(valid_grad)
 
     def start_batch(self):
         """Start a batch, this will sum all the gradients of the conv2d layers
         for every images backpropped after this function call."""
         self._batch = True
         self._batch_count = 0
-        self._zero_gradient()
+        # self._zero_gradient()
 
     def end_batch(self):
         """Stop current batch and divide all conv2d gradients with number of images in batch"""
         self._batch = False
-        for i, layer in enumerate(self.model.layers):
-            if isinstance(layer, torch.nn.Conv2d):
-                if layer.weight.grad is not None:
-                    layer.weight.grad.data /= self._batch_count
-                    layer.bias.grad.data /= self._batch_count
+        for key, layerstat in self._tree.items():
+            if isinstance(layerstat.layer, torch.nn.Conv2d):
+                if layerstat.layer.weight.grad is not None:
+                    layerstat.layer.weight.grad.data /= self._batch_count
+                    layerstat.layer.bias.grad.data /= self._batch_count
 
-    def _check_gradient_size(self, filled_grad_coords, gradient_sizes):
+    def _check_gradient_size(self, filled_grad_coords):
         correct = True
-        for i, size in enumerate(gradient_sizes):
-            filled_size = filled_grad_coords[-(i + 1)]
-            if size[0] > filled_size[2] and size[1] > filled_size[1]:
+        for name, box in filled_grad_coords.items():
+            size = self._tree[name].output_shape
+            if size.height != box.height or size.width != box.x:
                 correct = False
+                print(name, "original gradient shape:", (size.width, size.height),
+                      "reconstructed gradient shape: ", (box.x, box.height))
                 break
         if not correct:
             print("!!!! Some gradient are smaller than they should be",
@@ -1055,141 +832,178 @@ class StreamingSGD(object):
 
         return correct
 
-    def _getreconstructioninformation(self, layers, input_shape, stop_index=-1):
-        # TODO: we could also return the actual output sizes,
-        # could make some code in this class easier
+    # --------------------------
+    # Model layer utility functions
+    #
+    def _backward_sequential(self, layer, gradient, fill_gradients):
+        output_layer = self._tree[self._stream_to_layer]
+        while True:
+            layerstats = self._tree[layer]
+            output = self._layer_outputs[layer]
 
-        # NOTE: lost = left right top bottom
-        # padding = left top right bottom
-        #
-        lost = []
-        padding = []
-        downsamples = []
+            self._save_gradients()
+            output.backward(gradient=gradient, retain_graph=True)
 
-        last_shape = input_shape
+            # We carried the gradient to the input of current layer
+            # check if the previous layer has a gradient at all
+            # (eg input-layer will have None)
+            #
+            if self._layer_inputs[layer].grad is not None:
+                next_gradient = self._layer_inputs[layer].grad.clone()
+            else:
+                next_gradient = None
 
-        # TODO: add support for more types of layers (e.g. average layer)
-        for i, l in enumerate(layers):
-            if i == stop_index:
+            # Apply right part of the gradient
+            #
+            valid_grad, valid_lost = layerstats.trim_to_valid_gradient(gradient.clone(),
+                                                                       self._stream_to_layer,
+                                                                       self._current_tile)
+            valid_output = output[:, :,
+                                  int(valid_lost.top):int(output.shape[2] - valid_lost.bottom),
+                                  int(valid_lost.left):int(output.shape[3] - valid_lost.right)]
+
+            # Calculate location of output in current layers input
+            #
+            data_loc = layerstats.output_to_output_coords(
+                y=self._current_fmap_tile.y,
+                x=self._current_fmap_tile.x,
+                output_layer=output_layer)
+
+            if layer not in self._filled:
+                self._filled[layer] = Box(0, 0, 0, 0, None)
+
+            # Move the location according to how many pixels have been trimmed
+            # this will be the location of the valid gradient of this layer in relation
+            # to the actual gradient in a normal backpass
+            #
+            data_loc = Box(y=data_loc.y + valid_lost.top, height=0,
+                           x=data_loc.x + valid_lost.left, width=0, sides=None)
+
+            # Calculate which part of the gradient is 'new'
+            #
+            relevant_box, grad_filled = self.fill_tensor(data=valid_grad,
+                                                         data_loc=data_loc,
+                                                         tensor_shape=self._tree[layer].output_shape,
+                                                         already_filled=self._filled[layer])
+
+            self._filled[layer] = grad_filled
+
+            # Redo the valid and relevant (e.g. new) part of the backwards pass on this layer
+            #
+            self._restore_gradients()
+
+            if relevant_box.height > 0 and relevant_box.width > 0:
+                relevant_grad = valid_grad[:, :, relevant_box.y:relevant_box.y + relevant_box.height,
+                                           relevant_box.x:relevant_box.x + relevant_box.width]
+                relevant_output = valid_output[:, :, relevant_box.y:relevant_box.y + relevant_box.height,
+                                               relevant_box.x:relevant_box.x + relevant_box.width]
+
+                relevant_output.backward(gradient=relevant_grad)
+
+                # Fill gradients if we want to keep track of them
+                #
+                if fill_gradients:
+                    if layer not in self._gradients:
+                        self._gradients[layer] = torch.empty(self._tree[layer].output_shape)
+                        self._outputs[layer] = torch.empty(self._tree[layer].output_shape)
+
+                    self._gradients[layer][:, :,
+                                           int(grad_filled.y):int(grad_filled.height),
+                                           int(grad_filled.x - relevant_box.width):int(grad_filled.x)] = relevant_grad
+
+                    self._outputs[layer][:, :,
+                                         int(grad_filled.y):int(grad_filled.height),
+                                         int(grad_filled.x - relevant_box.width):int(grad_filled.x)] = relevant_output
+            gradient = next_gradient
+
+            # remove activations we do not need anymore
+            del self._layer_outputs[layer]
+            del self._layer_inputs[layer]
+
+            if layerstats.previous is None:
                 break
 
-            lost_this_layer = torch.FloatTensor([0, 0, 0, 0])
+            layer = layerstats.previous.name
 
-            # For the transposed convolutions the output size increases
-            #
-            if isinstance(l, torch.nn.ConvTranspose2d):
-                # TODO: not tested
-                #
-                # Currently only valid padding with a filter_size of 2 and stride 2 is supported
-                #
-                if l.kernel_size != (2, 2):
-                    print('Filter_size not supported', str(l.kernel_size), str(l))
-                elif l.stride != (2, 2):
-                    print('Stride not supported', str(l.stride), str(l))
+    def _add_hooks_sequential(self):
+        for name, layer in self._get_layers():
+            if isinstance(layer, torch.nn.Conv2d) or isinstance(layer, torch.nn.MaxPool2d):
+                layer.register_forward_pre_hook(self._forward_pre_hook)
 
-                # A valid padding with filter size of 2 and stride of 2 results in a output size
-                # that is double the size of the input image. No pixels are lost.
-                #
-                downsamples.append(torch.FloatTensor([0.5, 0.5]))
-            elif isinstance(l, torch.nn.UpsamplingBilinear2d):
-                downsamples.append(torch.FloatTensor([0.5, 0.5]))
+            if name == self._stream_to_layer:
+                break
+
+    def _forward_pre_hook(self, module, layer_input):
+        # detach input inplace
+        if self._layer_should_detach:
+            name = self._reverse_tree[module]
+            layerstats = self._tree[name]
+            if layerstats.previous:
+                self._layer_outputs[layerstats.previous.name] = layer_input[0].clone()
+            if layer_input[0]._grad_fn is not None:
+                layer_input[0].detach_()
+                layer_input[0].requires_grad = True
+            self._layer_inputs[name] = layer_input[0]
+
+    def _get_layers(self, name="", modules=None):
+        # set_trace()
+        if modules is None:
+            modules = self.model.named_children()
+
+        layers = []
+        for mod in modules:
+            if name:
+                layers.append((name + "-" + mod[0], mod[1]))
             else:
-                cur_stride = torch.FloatTensor(l.stride)
-                kernel_size = l.kernel_size
-                c_padding = l.padding
+                layers.append(mod)
+            try:
+                mod_layers = self._get_layers(mod[0], mod[1].named_children())
+                if name:
+                    mod_layers = [(name + "-" + md[0], md[1]) for md in mod_layers]
+                layers.extend(mod_layers)
+            except StopIteration:
+                pass
 
-                if isinstance(l, torch.nn.MaxPool2d):
-                    cur_stride = torch.FloatTensor([l.stride, l.stride])
-                    kernel_size = (kernel_size, kernel_size)
-                else:
-                    output_channels = l.out_channels
+        return layers
 
-                if isinstance(l.padding, int):
-                    c_padding = [l.padding, l.padding]
+    def _create_sequential_tree(self, input_shape):
+        layer_dict = dict(self._get_layers())
 
-                # Equations of the paper
-                #
-                lost_due_kernel_row = (kernel_size[0] - cur_stride[0]) / 2
-                lost_due_stride_row = (last_shape[2] + c_padding[0] * 2 - kernel_size[0]) % cur_stride[0]
+        # loop through layers and do layer_stats, save in dict
+        stats = {}
+        reverse_stats = {}
+        current_shape = input_shape
+        prev_name = None
+        streaming = True
+        unsupported_classes = []
+        for name, layer in layer_dict.items():
+            if not isinstance(layer, torch.nn.Conv2d) and \
+               not isinstance(layer, torch.nn.MaxPool2d) and \
+               not isinstance(layer, torch.nn.Linear):
+                if type(layer).__name__ not in unsupported_classes:
+                    unsupported_classes.append(type(layer).__name__)
+                continue
+            stats[name] = LayerStats.stats_with_layer(layer, current_shape, name)
+            stats[name].streaming = streaming
+            if name == self._stream_to_layer:
+                streaming = False
+            reverse_stats[layer] = name
+            current_shape = stats[name].output_shape
+            if prev_name is not None:
+                stats[name].previous = stats[prev_name]
+                stats[prev_name].next = stats[name]
+            else:
+                stats[name].previous = None
 
-                lost_due_kernel_column = (kernel_size[1] - cur_stride[1]) / 2
-                lost_due_stride_column = (last_shape[3] + c_padding[1] * 2 - kernel_size[1]) % cur_stride[1]
+            prev_name = name
+        if unsupported_classes:
+            print("The following layers are unsupported:")
+            for unsupported_class in unsupported_classes:
+                print("-", unsupported_class)
+            print("If these layers do not alter input or output shape and "
+                  "have no zero-padding, there shouldn't be a problem. (e.g. ReLU is fine). "
+                  "Note: all layers in non-streaming part of the network are (in theory) supported. "
+                  "However we need to calculate the output shape of those layers. "
+                  "Please open an issue for if you encounter errors.\n")
+        return stats, reverse_stats
 
-                p_left = math.floor(lost_due_kernel_row)
-                p_right = math.ceil(lost_due_kernel_row) + lost_due_stride_row
-
-                p_top = math.floor(lost_due_kernel_column)
-                p_bottom = math.ceil(lost_due_kernel_column) + lost_due_stride_column
-
-                lost_this_layer = torch.FloatTensor([p_left, p_right, p_top, p_bottom])
-                padding_this_layer = torch.FloatTensor([c_padding[1], c_padding[0]])
-
-                # Different way of calculating total pixels lost
-                #
-                total_lost_row = last_shape[2] - (math.floor((last_shape[2] - kernel_size[0]) / cur_stride[0]) + 1) * cur_stride[0]
-                total_lost_column = last_shape[3] - (math.floor((last_shape[3] - kernel_size[1]) / cur_stride[1]) + 1) * cur_stride[1]
-
-                # Check if reconstructions would be correct:
-                #
-                if total_lost_row != p_left + p_right or \
-                   total_lost_column != p_bottom + p_top:
-                    print("Invalid reconstruction, total lost row:", total_lost_row, "total lost column:",
-                          total_lost_column, "lost_this_layer", lost_this_layer.tolist)
-                    print("Layer info", l, "kernel size:", kernel_size, "stride", cur_stride, "last_shape", last_shape)
-
-                next_shape = [1, output_channels,
-                              last_shape[2] - p_top - p_bottom + c_padding[0] * 2,
-                              last_shape[2] - p_left - p_right + c_padding[1] * 2]
-                next_shape[2] //= cur_stride[0]
-                next_shape[3] //= cur_stride[1]
-
-                if self._verbose:
-                    print(next_shape, cur_stride.tolist(), lost_this_layer.tolist(), l.__class__.__name__)
-
-            last_shape = next_shape
-            lost.append(lost_this_layer)
-            padding.append(padding_this_layer)
-            downsamples.append(cur_stride)
-
-        # Convert to float for potential upsampling
-        #
-        downsamples = [torch.FloatTensor([float(x), float(y)]) for x, y in downsamples]
-        layer_padding = torch.FloatTensor(len(padding), 4)
-
-        c_padding = torch.FloatTensor([0, 0, 0, 0])  # left top right bottom
-        c_padding[0] += padding[0][0]
-        c_padding[1] += padding[0][1]
-        c_padding[2] += padding[0][0]
-        c_padding[3] += padding[0][1]
-
-        layer_padding[0][0] = c_padding[0]
-        layer_padding[0][1] = c_padding[1]
-        layer_padding[0][2] = c_padding[2]
-        layer_padding[0][3] = c_padding[3]
-
-        for i in range(1, len(downsamples)):
-            c_padding[0] += padding[i][0]
-            c_padding[1] += padding[i][1]
-            c_padding[2] += padding[i][0]
-            c_padding[3] += padding[i][1]
-
-            c_padding[0] = math.ceil(c_padding[0] / downsamples[i][0])
-            c_padding[1] = math.ceil(c_padding[1] / downsamples[i][1])
-            c_padding[2] = math.ceil(c_padding[2] / downsamples[i][0])
-            c_padding[3] = math.ceil(c_padding[3] / downsamples[i][1])
-
-            downsamples[i] *= downsamples[i - 1]
-            lost[i][0:2] *= downsamples[i - 1][0]
-            lost[i][2:] *= downsamples[i - 1][1]
-
-            padding[i][0] *= downsamples[i - 1][0]
-            padding[i][1] *= downsamples[i - 1][1]
-
-            layer_padding[i][0] = c_padding[0]
-            layer_padding[i][1] = c_padding[1]
-            layer_padding[i][2] = c_padding[2]
-            layer_padding[i][3] = c_padding[3]
-
-        # print(layer_padding)
-
-        return lost, downsamples, padding, layer_padding

@@ -9,17 +9,15 @@ the maximum dimensions of the input data. We demonstrate a method to train
 convolutional neural networks holding only parts of the image in memory while
 giving equivalent results.
 
-**Working on refactoring the code in [develop branch](https://github.com/DIAGNijmegen/StreamingSGD/tree/develop) (should be clearer)**
-
 ### See [notebook](https://github.com/DIAGNijmegen/StreamingSGD/blob/master/SSGD%20example.ipynb) for example usage
 
 # Requirements
-  - PyTorch 0.3.1
+  - PyTorch 0.4
   - tqdm
   
 # Model compatibility
-  - Layers supported:
-    - Conv2d layers (without padding)
+  - Layers supported (for now):
+    - Conv2d layers (SAME padding now works, [example](https://github.com/DIAGNijmegen/StreamingSGD/blob/master/SSGD%20same%20padding.ipynb))
     - MaxPool2d layer
     - (all layer types are supported in the non-streaming part of the model)
   - Should work with all:
@@ -27,14 +25,12 @@ giving equivalent results.
     - Loss functions (when using mini-batches: if they are averaged over the instances in the batch)
     - Optimizers
   - Currently under development:
-    - Conv2d with padding
-    
+    - Batch normalization alternative
+
 # Model requirements
-  - `model.layers`: list of layers in order of execution
-  - `model.gradients`: list of gradients of the inputs to convolutional operations
-  - `model.output`: list of outputs of the convolutional operations
-  - `model.forward(x, stop_index=-1, start_index=0, detach=False)`: add start/stop-index to forward function and ability to detach leaves from the graph. 
-  - (See the notebook for example implementation)
+  - `model.forward(x, stop_at_layer, start_at_layer)`: the class will call the forward function of the model with two extra arguments  
+  - See the [notebook](https://github.com/DIAGNijmegen/StreamingSGD/blob/master/SSGD%20example.ipynb) for example implementation
 
 # Mini-batch support
-- Start a mini-batch by calling .start_batch() en end by calling .end_batch(), all images processed in between those calls are part of the mini-batch.
+  - Start a mini-batch by calling .start_batch() en end by calling .end_batch(), all images processed in between those calls are part of the mini-batch.
+  - See [example notebook](https://github.com/DIAGNijmegen/StreamingSGD/blob/develop/SSGD%20example%20(with%20mini-batch).ipynb)
