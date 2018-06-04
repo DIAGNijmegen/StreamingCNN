@@ -740,7 +740,7 @@ class StreamingSGD(object):
         if fill_gradients:
             return self._gradients, self._outputs
         else:
-            return None
+            return (None, None)
 
     # --------------------------
     # Gradient utility functions
