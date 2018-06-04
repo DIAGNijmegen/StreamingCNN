@@ -143,7 +143,6 @@ class LayerStats(object):
 
             input_height -= self.padding.top + self.padding.bottom
             input_width -= self.padding.left + self.padding.right
-        # if valid:
 
         # print(input_height, input_width)
 
