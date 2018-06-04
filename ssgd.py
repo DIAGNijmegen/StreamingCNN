@@ -434,79 +434,69 @@ class StreamingSGD(object):
                 map_x = max(x - last_layer_stats.total_padding.left, 0)
                 map_y = max(y - last_layer_stats.total_padding.top, 0)
 
-                tile_y, _, tile_x, _, _ = self._tree[self._first_layer].calculate_input_coords_for_output(
-                    y=map_y, x=map_x, output_layer=last_layer_stats)
+                tile_y, _, tile_x = first_layer_stats.output_to_input_coords(
+                    y=map_y, x=map_x, output_layer=last_layer_stats)[0:3]
 
-                # Keep track if we are at the sides (because we shouldn't crop the output here)
-                #
                 sides = Sides(left=(x == 0), top=(y == 0),
                               right=(tile_x + tile_shape.width >= self._input_size.width),
                               bottom=(tile_y + tile_shape.height >= self._input_size.height))
 
-                # Move map coordinates based on position (sides) and padding
-                #
-                # The problem is that the tile on the right edge not always fits on the
-                # downsampling grid. The best solution would be to recalculate output_lost for this tile
-                # this would mean output-lost has to be tile specific. It currently is layer specific.
                 map_height = map_tile_shape.height
                 map_width = map_tile_shape.width
 
                 tile_height = tile_shape.height
                 tile_width = tile_shape.width
 
+                check_output_lost = False
+
+                # Adjust for bottom and right edge and make sure the tile coordinates are
+                # multiples of total downsampling in network.
+                #
                 if sides.bottom:
                     tile_y = self._input_size.height - tile_height
                     map_y = output_shape.height - map_height
 
                     if tile_y % float(downsampling[0]) > 0:
                         map_y = math.floor(tile_y / downsampling[0])
-                        tile_y = self._tree[self._first_layer].calculate_input_coords_for_output(
-                            y=map_y, x=map_x, output_layer=last_layer_stats).y
+                        check_output_lost = True
 
-                        tile_height = self._input_size.height - tile_y
-                        bottom_tile_shape = IOShape(0, 0, tile_height, tile_height)
-                        bottom_shape, output_lost, g_o_l = self._tree[self._first_layer].calculate_output_shape(bottom_tile_shape,
-                                                                                                                output_layer=last_layer_stats)
-
-                        next_layer = self._tree[self._first_layer]
-                        print()
-                        for i in range(len(g_o_l)):
-                            if next_layer.gradient_lost != g_o_l[i]:
-                                print("Output lost difference!", next_layer.name, next_layer.output_lost, output_lost[i])
-
-                        map_height = bottom_shape.height
-
-                        if map_y + map_height != output_shape.height:
-                            print("Warning: the reconstructed feature map size is smaller or bigger than the feature map of the whole image.",
-                                  "This can cause small differences in gradients")
                 if sides.right:
                     tile_x = self._input_size.width - tile_width
                     map_x = output_shape.width - map_width
 
                     if tile_x % float(downsampling[1]) > 0:
                         map_x = math.floor(tile_x / downsampling[1])
-                        tile_x = self._tree[self._first_layer].calculate_input_coords_for_output(
-                            y=map_y, x=map_x, output_layer=last_layer_stats).x
+                        check_output_lost = True
 
-                        tile_width = self._input_size.width - tile_x
-                        right_tile_shape = IOShape(0, 0, tile_width, tile_width)
-                        right_shape, output_lost, g_o_l = self._tree[self._first_layer].calculate_output_shape(right_tile_shape,
-                                                                                                               output_layer=last_layer_stats)
-                        next_layer = self._tree[self._first_layer]
-                        print()
-                        for i in range(len(g_o_l)):
-                            if next_layer.gradient_lost != g_o_l[i]:
-                                print("Output lost difference!", next_layer.name, next_layer.output_lost, output_lost[i])
+                # If we changed x or y coordinate of tile, and size of tile,
+                # we should check what happens to output lost (i.e. output shape)
+                #
+                if check_output_lost:
+                    tile_y, _, tile_x = first_layer_stats.output_to_input_coords(
+                        y=map_y, x=map_x, output_layer=last_layer_stats)[0:3]
 
-                        map_width = right_shape.width
-                        if map_x + map_width > output_shape.width:
-                            print("Warning: the reconstructed feature map size is bigger than the feature map of the whole image.",
-                                  "This can cause small differences in gradients.")
+                    tile_width = self._input_size.width - tile_x
+                    tile_height = self._input_size.height - tile_y
+
+                    new_tile_shape = IOShape(0, 0, tile_height, tile_width)
+                    new_shape, output_lost, _ = \
+                        first_layer_stats.calculate_output_shape(new_tile_shape, output_layer=last_layer_stats)
+
+                    self._compare_output_lost(output_lost)
+
+                    map_height = new_shape.height
+                    map_width = new_shape.width
+
+                    if map_x + map_width != output_shape.width or map_y + map_height != output_shape.height:
+                        print("Warning: the reconstructed feature map size is slightly "
+                              "bigger or smaller than the feature map of the whole image."
+                              "This can cause small differences in gradients.")
 
                 tile_box = Box(tile_y, tile_height, tile_x, tile_width, sides)
                 embed_box = Box(map_y, map_height, map_x, map_width, sides)
 
-                # filter out duplicates
+                # Filter out duplicates
+                #
                 exists = False
                 for e_b in embed_boxes:
                     if e_b.x == embed_box.x and e_b.y == embed_box.y:
