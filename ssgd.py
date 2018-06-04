@@ -924,7 +924,8 @@ class StreamingSGD(object):
 
     def _add_hooks_sequential(self):
         for name, layer in self._get_layers():
-            layer.register_forward_pre_hook(self._forward_pre_hook)
+            if isinstance(layer, torch.nn.Conv2d) or isinstance(layer, torch.nn.MaxPool2d):
+                layer.register_forward_pre_hook(self._forward_pre_hook)
 
             if name == self._stream_to_layer:
                 break
