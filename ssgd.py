@@ -941,15 +941,21 @@ class StreamingSGD(object):
                 layer_input[0].requires_grad = True
             self._layer_inputs[name] = layer_input[0]
 
-    def _get_layers(self, modules=None):
+    def _get_layers(self, name="", modules=None):
+        # set_trace()
         if modules is None:
             modules = self.model.named_children()
 
         layers = []
         for mod in modules:
-            layers.append(mod)
+            if name:
+                layers.append((name + "-" + mod[0], mod[1]))
+            else:
+                layers.append(mod)
             try:
-                mod_layers = self._get_layers(mod[1].named_children())
+                mod_layers = self._get_layers(mod[0], mod[1].named_children())
+                if name:
+                    mod_layers = [(name + "-" + md[0], md[1]) for md in mod_layers]
                 layers.extend(mod_layers)
             except StopIteration:
                 pass
