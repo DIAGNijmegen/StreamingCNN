@@ -8,7 +8,6 @@ from collections import namedtuple
 import torch
 
 from tqdm import tqdm
-from IPython.core.debugger import set_trace
 
 # Utility named tuples, makes code more readable
 #
