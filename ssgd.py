@@ -208,18 +208,6 @@ class LayerStats(object):
         else:
             return self.padding
 
-    @property
-    def total_output_lost(self) -> Lost:
-        # should probably cache this
-        if self.previous is not None:
-            prev_lost = self.previous.total_output_lost
-            return Lost(top=self.output_lost.top + math.ceil(prev_lost.top / self.downsamples[0]),
-                        left=self.output_lost.left + math.ceil(prev_lost.left / self.downsamples[1]),
-                        bottom=self.output_lost.bottom + math.ceil(prev_lost.bottom / self.downsamples[0]),
-                        right=self.output_lost.right + math.ceil(prev_lost.right / self.downsamples[1]))
-        else:
-            return Lost(0, 0, 0, 0)
-
     def total_gradient_lost(self, output_layer) -> Lost:
         if self.name == output_layer or self.next is None:
             return Lost(0, 0, 0, 0)
