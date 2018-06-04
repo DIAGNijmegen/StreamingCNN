@@ -965,7 +965,14 @@ class StreamingSGD(object):
         current_shape = input_shape
         prev_name = None
         streaming = True
+        unsupported_classes = []
         for name, layer in layer_dict.items():
+            if not isinstance(layer, torch.nn.Conv2d) and \
+               not isinstance(layer, torch.nn.MaxPool2d) and \
+               not isinstance(layer, torch.nn.Linear):
+                if type(layer).__name__ not in unsupported_classes:
+                    unsupported_classes.append(type(layer).__name__)
+                continue
             stats[name] = LayerStats.stats_with_layer(layer, current_shape, name)
             stats[name].streaming = streaming
             if name == self._stream_to_layer:
@@ -979,5 +986,14 @@ class StreamingSGD(object):
                 stats[name].previous = None
 
             prev_name = name
-
+        if unsupported_classes:
+            print("The following layers are unsupported:")
+            for unsupported_class in unsupported_classes:
+                print("-", unsupported_class)
+            print("If these layers do not alter input or output shape and "
+                  "have no zero-padding, there shouldn't be a problem. (e.g. ReLU is fine). "
+                  "Note: all layers in non-streaming part of the network are (in theory) supported. "
+                  "However we need to calculate the output shape of those layers. "
+                  "Please open an issue for if you encounter errors.\n")
         return stats, reverse_stats
+
