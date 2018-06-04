@@ -177,7 +177,13 @@ class LayerStats(object):
 
         return in_shape, output_lost, grad_output_lost
 
-    def calculate_input_coords_for_output(self, y: int, x: int, output_layer):
+    def output_to_input_coords(self, y: int, x: int, output_layer):
+        total_downsamples = output_layer.downsampling_upto(self.name)
+        tile_x = x * total_downsamples[1] * self.downsamples[1]
+        tile_y = y * total_downsamples[0] * self.downsamples[0]
+        return Box(y=max(tile_y, 0), height=0, x=max(tile_x, 0), width=0, sides=None)
+
+    def output_to_output_coords(self, y: int, x: int, output_layer):
         total_downsamples = output_layer.downsampling_upto(self.name)
         tile_x = x * total_downsamples[1]
         tile_y = y * total_downsamples[0]
@@ -382,41 +388,47 @@ class StreamingSGD(object):
         for the forward pass to reconstruct the feature map
         """
         last_layer_stats = self._tree[self._stream_to_layer]
+        first_layer_stats = self._tree[self._first_layer]
+
         output_shape = last_layer_stats.output_shape
         downsampling = last_layer_stats.total_downsampling
+
         output_tile_shape = IOShape(batch=0, channels=0,
                                     height=output_shape.height // self._divide_in,
                                     width=output_shape.width // self._divide_in)
 
         tile_shape = last_layer_stats.calculate_valid_input_shape(output_tile_shape, gradient_lost=backwards)
 
-        map_tile_shape, output_lost, grad_output_lost = self._tree[self._first_layer].calculate_output_shape(tile_shape,
-                                                                                                             output_layer=last_layer_stats)
+        map_tile_shape, output_lost, grad_output_lost = \
+            first_layer_stats.calculate_output_shape(tile_shape, output_layer=last_layer_stats)
 
+        # To be sure that output_lost is the same everywhere we should do a normal calculate input shape:
+        #
         if backwards:
             print('back', tile_shape, map_tile_shape)
 
-            # to be sure that output_lost is the same everywhere we should do a normal calculate input shape:
-            new_tile_shape = last_layer_stats.calculate_input_shape(map_tile_shape, valid=False, gradient_lost=False)
+            new_tile_shape = last_layer_stats.calculate_input_shape(map_tile_shape)
 
             map_tile_shape, output_lost, grad_output_lost = \
-                self._tree[self._first_layer].calculate_output_shape(new_tile_shape, output_layer=last_layer_stats)
+                first_layer_stats.calculate_output_shape(new_tile_shape, output_layer=last_layer_stats)
 
+            # If the new input shape results in a smaller output than we want, do the calculation again
+            # with a bigger output shape.
+            #
             if new_tile_shape.height < tile_shape.height or new_tile_shape.width < tile_shape.width:
                 map_tile_shape = IOShape(0, 0, map_tile_shape.height + 1, map_tile_shape.width + 1)
-                tile_shape = last_layer_stats.calculate_input_shape(map_tile_shape, valid=False, gradient_lost=False)
+                tile_shape = last_layer_stats.calculate_input_shape(map_tile_shape)
+
                 map_tile_shape, output_lost, grad_output_lost = \
-                    self._tree[self._first_layer].calculate_output_shape(tile_shape, output_layer=last_layer_stats)
+                    first_layer_stats.calculate_output_shape(tile_shape, output_layer=last_layer_stats)
             else:
                 tile_shape = new_tile_shape
 
             print("new", tile_shape, map_tile_shape)
 
-        next_layer = self._tree[self._first_layer]
-        for i in range(len(output_lost)):
-            if next_layer.output_lost != output_lost[i]:
-                print("Lost diff!", next_layer.name, next_layer.output_lost, "tile:", output_lost[i])
-            next_layer = next_layer.next
+        # The tiles should have the same output_lost, but still check
+        #
+        self._compare_output_lost(output_lost)
 
         # The size of the patch/tile is feature map / divide_in
         #
@@ -507,8 +519,18 @@ class StreamingSGD(object):
                 tile_boxes.append(tile_box)
                 embed_boxes.append(embed_box)
 
-        # TODO: re-add output_lost check?
         return tile_boxes, embed_boxes
+
+    def _compare_output_lost(self, output_lost):
+        next_layer = self._tree[self._first_layer]
+        difference = False
+        for i in range(len(output_lost)):
+            if next_layer.output_lost != output_lost[i]:
+                print("Output lost difference!", next_layer.name, next_layer.output_lost, output_lost[i])
+                difference = True
+                break
+            next_layer = next_layer.next
+        return difference
 
     def _forward_patches(self, image):
         """
