@@ -269,7 +269,7 @@ class StreamingSGD(object):
     until the configured layer index, after that the feature map is run normally until
     the end of the network. The same happens in de backwards pass.
     """
-    def __init__(self, model, stream_to_layer, input_shape, divide_in, cuda=False, verbose=False):
+    def __init__(self, model, stream_to_layer, input_shape, divide_in, cuda=False, verbose=False, only_backward_tiles=False):
         """Configures the class
 
         Function calculates the coordinates of the forward and backward tiles.
@@ -308,6 +308,7 @@ class StreamingSGD(object):
         self._saved_gradients = {}
         self._gradients = {}
         self._outputs = {}
+        self._only_backward_tiles = only_backward_tiles
 
         # Add hooks for the backwards pass
         #
@@ -315,11 +316,16 @@ class StreamingSGD(object):
 
         # Precalculate the coordinates of the tiles in the forward pass
         #
-        self._forward_tiles, self._map_coords = self._calculate_tile_boxes()
+        if not self._only_backward_tiles:
+            self._forward_tiles, self._map_coords = self._calculate_tile_boxes()
 
         # Precalculate the coordinates of the tiles in the backward pass
         #
         self._back_tiles, self._grad_map_coords = self._calculate_tile_boxes(backwards=True)
+
+        if self._only_backward_tiles:
+            self._forward_tiles = self._back_tiles
+            self._map_coords = self._grad_map_coords
 
         if self._verbose:
             print("Tile size forward:", (self._forward_tiles[0].height, self._forward_tiles[0].width))
@@ -1006,4 +1012,3 @@ class StreamingSGD(object):
                   "However we need to calculate the output shape of those layers. "
                   "Please open an issue for if you encounter errors.\n")
         return stats, reverse_stats
-
