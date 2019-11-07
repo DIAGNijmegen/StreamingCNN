@@ -151,7 +151,6 @@ class StreamingCNN(object):
         p_stats = self._prev_stats(output)
         self.output_stride = p_stats['output_stride'] * p_stats['stride'] if p_stats else [1, 1]
 
-        from pdb import set_trace; set_trace()
         self.tile_gradient_lost = self._non_max_border_amount(tile.grad)
         if self.verbose: print('\n', 'Input gradient lost', self.tile_gradient_lost)
 
