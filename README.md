@@ -1,5 +1,5 @@
-# StreamingSGD
-This repository is an example implementation of Streaming SGD as published here: 
+# StreamingCNN
+This repository is an example implementation of StreamingCNN as published here: 
 
 - ArXiv 2019 (full paper): ...
 - MIDL 2018 (abstract, proof of concept): https://openreview.net/forum?id=HJ7lIcjoM
