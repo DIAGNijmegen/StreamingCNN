@@ -536,11 +536,11 @@ class StreamingCNN(object):
             if stride[0] > 1 and kernel_size[0] > stride[0]:
                 valid_lost = self._non_max_border_amount(f_grad)
                 valid_grad.fill_(0)
-                diff = kernel_size[0] - stride[0]
-                valid_grad[valid_lost.top:
-                           valid_grad.shape[0] - valid_lost.bottom - diff,
-                           valid_lost.left:
-                           valid_grad.shape[1] - valid_lost.right - diff] = 1
+                overlap = kernel_size[0] - stride[0]
+                valid_grad[valid_lost.top + overlap:
+                           valid_grad.shape[0] - valid_lost.bottom - overlap,
+                           valid_lost.left + overlap:
+                           valid_grad.shape[1] - valid_lost.right - overlap] = 1
 
             new_grad_in = valid_grad[None].expand(grad_in[0].shape[1], *valid_grad.shape)[None]
             return ((new_grad_in.type(self.dtype) * 10 - 1), *grad_in[1:])

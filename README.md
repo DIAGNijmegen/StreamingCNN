@@ -12,7 +12,8 @@ the maximum dimensions of the input data. We demonstrate a method to train
 convolutional neural networks holding only parts of the image in memory while
 giving equivalent results.
 
-### See [notebook](https://github.com/DIAGNijmegen/StreamingSGD/blob/master/SSGD%20example.ipynb) for example usage
+### See [this notebook](https://github.com/DIAGNijmegen/StreamingCNN/blob/master/sCNN%20numerical%20comparison.ipynb) for a numerical comparison between streaming and conventional backpropagation.
+### See [Imagenette example](https://github.com/DIAGNijmegen/StreamingCNN/blob/master/sCNN%20numerical%20comparison.ipynb) for an example training script, comparing training curves between streaming and conventional training.
 
 # Requirements
   - PyTorch 1.0+
