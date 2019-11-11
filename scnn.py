@@ -142,10 +142,12 @@ class StreamingCNN(object):
 
         # Gather backward statistics
         self._tile_output_shape = output.shape
-        valid_output = output[:, :,
-                              self.tile_output_lost.top:output.shape[2] - self.tile_output_lost.bottom,
-                              self.tile_output_lost.left:output.shape[3] - self.tile_output_lost.right]
-        valid_output.sum().backward()
+
+        gradient = torch.zeros(*output.shape, dtype=self.dtype, device=self.device)
+        gradient[:, :, 
+                 self.tile_output_lost.top:output.shape[2] - self.tile_output_lost.bottom,
+                 self.tile_output_lost.left:output.shape[3] - self.tile_output_lost.right] = 1
+        output.backward(gradient=gradient)
 
         # Calculate the output stride of the whole stream_module
         p_stats = self._prev_stats(output)
@@ -493,6 +495,8 @@ class StreamingCNN(object):
 
     def _backward_gather_statistics_hook(self, module, grad_in, grad_out):
         stride, kernel_size = self._stride_kernel_size_to_tuple(module)
+        print(grad_out[0])
+        exit()
 
         if grad_in[0] is not None:
             # We sum over the channels to deal with networks that do different operations
