@@ -2,7 +2,7 @@
 This repository is an example implementation of StreamingCNN as published here: 
 
 - Full paper (in review; arXiv preprint): http://arxiv.org/abs/1911.04432
-- MIDL 2018 (abstract, proof of concept): https://openreview.net/forum?id=HJ7lIcjoM, _this work based on [previous version](https://github.com/DIAGNijmegen/StreamingCNN/tree/befcb63e86d44730b9180a1db81427941e95b653) of the algorithm._
+- MIDL 2018 (abstract, proof of concept): https://openreview.net/forum?id=HJ7lIcjoM, _this work was based on [previous version](https://github.com/DIAGNijmegen/StreamingCNN/tree/befcb63e86d44730b9180a1db81427941e95b653) of the algorithm._
 
 **Abstract**
 To train deep convolutional neural networks, the input data and the intermediate
