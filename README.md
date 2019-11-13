@@ -11,6 +11,19 @@ Due to memory constraints on current hardware, most convolution neural networks 
 #### See [this notebook](https://github.com/DIAGNijmegen/StreamingCNN/blob/master/sCNN%20numerical%20comparison.ipynb) for a numerical comparison between streaming and conventional backpropagation.
 #### See [Imagenette example](https://github.com/DIAGNijmegen/StreamingCNN/blob/master/Imagenette%20example.ipynb) for an example comparing losses between streaming and conventional training.
 
+# Pseudocode example
+        
+```python
+sCNN = StreamingCNN(stream_layers, tile_shape=(1, 3, 600, 600))
+str_output = sCNN.forward(image)
+
+final_output = final_layers(str_output)
+loss = criterion(final_output, labels)
+
+loss.backward()
+sCNN.backward(image, str_output.grad)
+```
+
 # Requirements
   - PyTorch 1.0+
   - tqdm
