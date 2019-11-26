@@ -15,7 +15,7 @@ from tqdm import tqdm
 # Load and compile cpp code to call cudnn conv2d backward function
 dirname = os.path.dirname(__file__)
 filename = os.path.join(dirname, "conv2d_backward.cpp")
-conv2d_cudnn = load(name="conv2d_backward", sources=[filename], verbose=False)
+conv2d_cudnn = load(name="backward", sources=[filename], verbose=False)
 
 # Utility named tuples, makes code more readable
 class Sides(NamedTuple):
