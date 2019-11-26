@@ -495,8 +495,6 @@ class StreamingCNN(object):
 
     def _backward_gather_statistics_hook(self, module, grad_in, grad_out):
         stride, kernel_size = self._stride_kernel_size_to_tuple(module)
-        print(grad_out[0])
-        exit()
 
         if grad_in[0] is not None:
             # We sum over the channels to deal with networks that do different operations
