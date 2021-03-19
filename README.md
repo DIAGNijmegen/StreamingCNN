@@ -1,8 +1,12 @@
 # StreamingCNN
-This repository is an example implementation of StreamingCNN as published here: 
+**Please visit this repository for a complete training pipeline using this method: https://github.com/DIAGNijmegen/pathology-streaming-pipeline** 
 
-- Full paper (in review; arXiv preprint): http://arxiv.org/abs/1911.04432
-- MIDL 2018 (abstract, proof of concept): https://openreview.net/forum?id=HJ7lIcjoM, _this work was based on [previous version](https://github.com/DIAGNijmegen/StreamingCNN/tree/befcb63e86d44730b9180a1db81427941e95b653) of the algorithm._
+This repository is an example implementation of StreamingCNN as published here (please cite when using this work):
+
+- _Methods paper:_ H. Pinckaers, B. van Ginneken and G. Litjens, "Streaming convolutional neural networks for end-to-end learning with multi-megapixel images," in IEEE Transactions on Pattern Analysis and Machine Intelligence, doi: [10.1109/TPAMI.2020.3019563](https://ieeexplore.ieee.org/abstract/document/9178453) - [older preprint](http://arxiv.org/abs/1911.04432)
+
+- _MIDL 2018 (abstract, proof of concept):_ https://openreview.net/forum?id=HJ7lIcjoM, _this work was based on [previous version](https://github.com/DIAGNijmegen/StreamingCNN/tree/befcb63e86d44730b9180a1db81427941e95b653) of the algorithm._
+
 
 **Abstract**
 
