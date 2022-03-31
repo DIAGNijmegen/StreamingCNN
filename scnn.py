@@ -125,14 +125,9 @@ class StreamingConv2dF(torch.autograd.Function):
             # TODO: performance improvements possible by only backpropping valid input
             # grad_input_padding = _grad_input_padding(grad_output, inpt.shape, stride, padding, (weight.shape[2], weight.shape[3]))  
             # TODO: use this!?
-            if weight.shape[-1] == 1 or groups > 1 or stride[0] > 1:
-                grad_in = torch.nn.grad.conv2d_input(inpt.shape, weight, grad_output, stride,  # type:ignore
-                                                     padding, dilation, groups)  
-            else:
-                # with autocast(enabled=False): ?
-                grad_in = cpp_functions.backward_input(inpt.shape, grad_output, weight.to(inpt.dtype), stride, 
-                                                       padding, dilation, groups, 
-                                                       torch.backends.cudnn.benchmark, torch.backends.cudnn.deterministic)
+            grad_in = cpp_functions.backward_input(inpt.shape, grad_output, weight.to(inpt.dtype), padding, 
+                                                   stride, dilation, groups, 
+                                                   torch.backends.cudnn.benchmark, torch.backends.cudnn.deterministic)
         else:
             grad_in = None
 
