@@ -914,8 +914,8 @@ class StreamingCNN(object):
                 f_grad = torch.sum(grad_out[0], dim=1)[0]
                 f_grad = f_grad * new_outpt
                 f_grad = f_grad.cpu()
-                f_grad = np.repeat(f_grad, stride[0], axis=0)
-                f_grad = np.repeat(f_grad, stride[1], axis=1)
+                f_grad = np.repeat(f_grad, stride[1], axis=0)
+                f_grad = np.repeat(f_grad, stride[2], axis=1)
                 grad = np.zeros(grad_in[0].shape[2:])
                 grad[:f_grad.shape[0], :f_grad.shape[1]] = f_grad
                 f_grad = torch.from_numpy(grad)
