@@ -36,9 +36,6 @@ else:
     def backward_amp_decorator(func):
         return func
 
-# Load and compile cpp code to call cudnn conv2d backward function
-dirname = os.path.dirname(__file__)
-filename = os.path.join(dirname, "cpp_functions.cpp")
 
 # inspired by torch/nn/modules/utils.py
 def _ntuple(n):
